@@ -74,98 +74,96 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
         else:
             status_msg = await update.message.reply_text("🤖 **正在为您准备会话，连接浏览器...**")
 
-        # Acquire the lock (Wait for current turn in queue)
-        async with browser.lock:
-            # Update status once execution begins
-            if status_msg:
-                try:
-                    await status_msg.edit_text("🚀 **正在向 ChatGPT 提交请求，请稍候（可能需要 1-3 分钟）...**")
-                except Exception:
-                    # In case of minor Telegram rate limiting or edits failing, keep moving
-                    pass
-            
-            # Start background progress reporter to update elapsed time every 5 seconds
-            stop_progress = False
-            async def progress_reporter():
-                seconds = 0
-                while not stop_progress:
-                    await asyncio.sleep(5)
-                    if stop_progress:
-                        break
-                    seconds += 5
-                    hourglass = ["⏳", "⌛"][(seconds // 5) % 2]
-                    try:
-                        await status_msg.edit_text(
-                            f"🚀 **ChatGPT 正在处理您的请求...**\n"
-                            f"⏱️ 当前已用时: `{seconds}` 秒 {hourglass}"
-                        )
-                    except Exception:
-                        pass
-
-            reporter_task = asyncio.create_task(progress_reporter())
-
-            logger.info(f"Processing request: prompt='{prompt[:50]}', image={image_path}")
+        # Update status once execution begins
+        if status_msg:
             try:
-                result = await browser.send_message(prompt, image_path)
-            finally:
-                # Always ensure reporter task is stopped cleanly
-                stop_progress = True
-                await reporter_task
-            
-            # Delete status message
-            if status_msg:
+                await status_msg.edit_text("🚀 **正在向 ChatGPT 提交请求，请稍候（可能需要 1-3 分钟）...**")
+            except Exception:
+                pass
+        
+        # Start background progress reporter to update elapsed time every 5 seconds
+        stop_progress = False
+        async def progress_reporter():
+            seconds = 0
+            while not stop_progress:
+                await asyncio.sleep(5)
+                if stop_progress:
+                    break
+                seconds += 5
+                hourglass = ["⏳", "⌛"][(seconds // 5) % 2]
                 try:
-                    await status_msg.delete()
+                    await status_msg.edit_text(
+                        f"🚀 **ChatGPT 正在处理您的请求...**\n"
+                        f"⏱️ 当前已用时: `{seconds}` 秒 {hourglass}"
+                    )
                 except Exception:
                     pass
 
-            if result["status"] == "success":
-                # Send text response
-                response_text = result.get("text", "")
-                if response_text:
-                    await send_long_message(update, response_text)
-                
-                # Send generated images if any
-                img_paths = result.get("images", [])
-                if img_paths:
-                    logger.info(f"Sending {len(img_paths)} generated images back to Telegram...")
-                    if len(img_paths) == 1:
-                        # Single photo
-                        with open(img_paths[0], "rb") as photo:
-                            await update.message.reply_photo(
-                                photo=photo, 
-                                caption="🎨 DALL-E 3 生成的图片",
-                                write_timeout=120
-                            )
-                    else:
-                        # Multiple photos in media group
-                        media = [InputMediaPhoto(media=open(p, "rb")) for p in img_paths]
-                        await update.message.reply_media_group(
-                            media=media,
+        reporter_task = asyncio.create_task(progress_reporter())
+
+        logger.info(f"Processing request: prompt='{prompt[:50]}', image={image_path}")
+        try:
+            # Lock is now managed inside browser.send_message() itself
+            result = await browser.send_message(prompt, image_path)
+        finally:
+            # Always ensure reporter task is stopped cleanly
+            stop_progress = True
+            await reporter_task
+        
+        # Delete status message
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        if result["status"] == "success":
+            # Send text response
+            response_text = result.get("text", "")
+            if response_text:
+                await send_long_message(update, response_text)
+            
+            # Send generated images if any
+            img_paths = result.get("images", [])
+            if img_paths:
+                logger.info(f"Sending {len(img_paths)} generated images back to Telegram...")
+                if len(img_paths) == 1:
+                    # Single photo
+                    with open(img_paths[0], "rb") as photo:
+                        await update.message.reply_photo(
+                            photo=photo, 
+                            caption="🎨 DALL-E 3 生成的图片",
                             write_timeout=120
                         )
                 else:
-                    if "画" in prompt or "draw" in prompt.lower() or "image" in prompt.lower():
-                        logger.warning("Generation succeeded but no images were found in the last turn.")
-                        await update.message.reply_text("⚠️ **生成完成，但在页面上未提取到生成的图片，可能加载较慢或防盗链。**")
-                
-                # Clean up local temporary image file if we uploaded one
-                if image_path and os.path.exists(image_path):
-                    try:
-                        os.remove(image_path)
-                    except Exception as e:
-                        logger.warning(f"Failed to remove temp upload image {image_path}: {e}")
-
-                # Clean up generated images from local disk
-                for img_p in img_paths:
-                    if os.path.exists(img_p):
-                        try:
-                            os.remove(img_p)
-                        except Exception as e:
-                            logger.warning(f"Failed to remove temp generated image {img_p}: {e}")
+                    # Multiple photos in media group
+                    media = [InputMediaPhoto(media=open(p, "rb")) for p in img_paths]
+                    await update.message.reply_media_group(
+                        media=media,
+                        write_timeout=120
+                    )
             else:
-                error_msg = result.get("message", "未知错误")
-                await update.message.reply_text(f"❌ **操作失败**\n原因: {error_msg}")
+                if "画" in prompt or "draw" in prompt.lower() or "image" in prompt.lower():
+                    logger.warning("Generation succeeded but no images were found in the last turn.")
+                    await update.message.reply_text("⚠️ **生成完成，但在页面上未提取到生成的图片，可能加载较慢或防盗链。**")
+            
+            # Clean up local temporary image file if we uploaded one
+            if image_path and os.path.exists(image_path):
+                try:
+                    os.remove(image_path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp upload image {image_path}: {e}")
+
+            # Clean up generated images from local disk
+            for img_p in img_paths:
+                if os.path.exists(img_p):
+                    try:
+                        os.remove(img_p)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove temp generated image {img_p}: {e}")
+        else:
+            error_msg = result.get("message", "未知错误")
+            await update.message.reply_text(f"❌ **操作失败**\n原因: {error_msg}")
 
     except Exception as e:
         logger.error(f"Uncaught error in handle_request: {e}", exc_info=True)
@@ -200,21 +198,40 @@ async def on_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(handle_request(update, context, prompt=caption, image_path=local_path))
 
 async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to start a fresh ChatGPT conversation session."""
+    """Command to start a fresh ChatGPT conversation session.
+    
+    Refuses to execute if other tasks are currently queued/running,
+    to prevent destroying another user's ongoing conversation context.
+    """
     global queue_counter
+
+    # Safety check: refuse if other tasks are active
     async with queue_lock:
+        if queue_counter > 0:
+            await update.message.reply_text(
+                "⚠️ **无法清理会话**\n\n"
+                f"当前有 {queue_counter} 个任务正在排队或执行中。\n"
+                "请等待所有任务完成后再使用 `/new` 命令，以免破坏其他用户的对话上下文。",
+                parse_mode="Markdown"
+            )
+            return
         queue_counter += 1
     
     status_msg = await update.message.reply_text("🔄 **正在请求开启新会话...**")
     try:
-        async with browser.lock:
-            await status_msg.edit_text("🚀 **正在清理浏览器上下文，开启新会话...**")
-            result = await browser.new_chat()
-            await status_msg.delete()
-            if result["status"] == "success":
-                await update.message.reply_text("✅ **成功开启新会话！**\n之前的上下文已被清除。")
-            else:
-                await update.message.reply_text(f"❌ **开启新会话失败**: {result.get('message')}")
+        await status_msg.edit_text("🚀 **正在清理浏览器上下文，开启新会话...**")
+        # Lock is now managed inside browser.new_chat() itself
+        result = await browser.new_chat()
+        await status_msg.delete()
+        if result["status"] == "success":
+            await update.message.reply_text(
+                "✅ **成功开启新会话！**\n"
+                "之前的上下文已被清除。\n\n"
+                "⚠️ *注意：所有用户（包括 Streamlit 前端）的对话上下文均已重置。*",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"❌ **开启新会话失败**: {result.get('message')}")
     except Exception as e:
         await update.message.reply_text(f"❌ **操作出错**: {e}")
     finally:

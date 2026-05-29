@@ -1,12 +1,62 @@
 import asyncio
 import base64
 import os
+import sys
 import time
 import logging
+from contextlib import contextmanager
 from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Cross-process file lock
+# ---------------------------------------------------------------------------
+class _FileLock:
+    """OS-level file lock that works across independent processes.
+
+    On Windows uses msvcrt.locking; on POSIX uses fcntl.flock.
+    This guarantees only one process can hold the lock at a time,
+    preventing bot.py and app_streamlit.py from driving the browser
+    simultaneously.
+    """
+
+    def __init__(self, path: str):
+        self._path = path
+        self._fd = None
+
+    @contextmanager
+    def acquire(self):
+        """Context manager: acquires the lock, yields, then releases."""
+        # Open (or create) the lock file; keep the fd open while held.
+        self._fd = os.open(self._path, os.O_CREAT | os.O_RDWR)
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                # LK_LOCK blocks until the lock is available
+                msvcrt.locking(self._fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fd, fcntl.LOCK_EX)
+            logger.debug("File lock acquired: %s", self._path)
+            yield
+        finally:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    try:
+                        msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = None
+                logger.debug("File lock released: %s", self._path)
 
 class ChatGPTBrowser:
     def __init__(self, cdp_url="http://127.0.0.1:9222", temp_dir=None):
@@ -18,6 +68,9 @@ class ChatGPTBrowser:
         self.context = None
         self.page = None
         self.lock = asyncio.Lock()
+        # Cross-process file lock — prevents bot.py and Streamlit from
+        # controlling the browser at the same time.
+        self._file_lock = _FileLock(os.path.join(self.temp_dir, ".browser.lock"))
 
     async def start(self):
         """Connect to the Chrome instance via CDP and find/open the ChatGPT page."""
@@ -122,7 +175,27 @@ class ChatGPTBrowser:
             return False
 
     async def send_message(self, prompt, image_path=None, timeout_minutes=6):
-        """Sends a message to ChatGPT, handles image uploads if present, and returns the response."""
+        """Sends a message to ChatGPT, handles image uploads if present, and returns the response.
+
+        Uses both an asyncio.Lock (intra-process) and a file lock (cross-process)
+        to ensure only one caller drives the browser at any given time.
+        """
+        async with self.lock:
+            return await self._send_message_inner(prompt, image_path, timeout_minutes)
+
+    async def _send_message_inner(self, prompt, image_path=None, timeout_minutes=6):
+        """Inner implementation of send_message, called while holding the asyncio lock."""
+        # Acquire cross-process file lock in a thread so we don't block the event loop
+        loop = asyncio.get_running_loop()
+        lock_ctx = self._file_lock.acquire()
+        await loop.run_in_executor(None, lock_ctx.__enter__)
+        try:
+            return await self._do_send_message(prompt, image_path, timeout_minutes)
+        finally:
+            await loop.run_in_executor(None, lock_ctx.__exit__, None, None, None)
+
+    async def _do_send_message(self, prompt, image_path=None, timeout_minutes=6):
+        """Core send-message logic, called while holding both locks."""
         # Ensure browser is connected
         try:
             if not self.page or self.page.is_closed():
@@ -366,7 +439,22 @@ class ChatGPTBrowser:
             return {"status": "error", "message": f"Browser interaction error: {e}"}
 
     async def new_chat(self):
-        """Navigates to chatgpt.com to start a new conversation thread."""
+        """Navigates to chatgpt.com to start a new conversation thread.
+
+        Acquires both the asyncio lock and the cross-process file lock
+        to prevent conflicts with any concurrent send_message calls.
+        """
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            lock_ctx = self._file_lock.acquire()
+            await loop.run_in_executor(None, lock_ctx.__enter__)
+            try:
+                return await self._do_new_chat()
+            finally:
+                await loop.run_in_executor(None, lock_ctx.__exit__, None, None, None)
+
+    async def _do_new_chat(self):
+        """Inner new_chat implementation, called while holding both locks."""
         try:
             if not self.page or self.page.is_closed():
                 await self.start()

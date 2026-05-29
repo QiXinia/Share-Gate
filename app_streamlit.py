@@ -32,7 +32,6 @@ class BrowserRunner:
             self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
-        self.lock = threading.Lock()
 
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -120,7 +119,11 @@ if st.sidebar.button("🔄 刷新状态"):
     st.rerun()
 
 try:
-    browser_status = runner.run_coroutine(runner.browser.get_status()).result()
+    browser_status = runner.run_coroutine(runner.browser.get_status()).result(timeout=5)
+    # If disconnected, the background thread may still be initializing — wait and retry once
+    if browser_status.get("status") != "connected":
+        time.sleep(3)
+        browser_status = runner.run_coroutine(runner.browser.get_status()).result(timeout=5)
 except Exception as e:
     browser_status = {"status": "error", "message": str(e)}
 
@@ -130,19 +133,40 @@ if browser_status.get("status") == "connected":
 else:
     st.sidebar.error(f"未连接 | 原因: {browser_status.get('message', 'CDP 端口未开启')}")
 
-# Reset/New Chat operation
+# Reset/New Chat operation — two-step confirmation to prevent accidental context loss
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚙️ 会话控制")
-if st.sidebar.button("🗑️ 清理会话 (开启新对话)", use_container_width=True):
-    with st.sidebar.spinner("正在重置浏览器会话..."):
-        res = runner.run_coroutine(runner.browser.new_chat()).result()
-        if res["status"] == "success":
-            st.session_state.messages = []
-            st.sidebar.success("会话重置成功！")
-            time.sleep(1)
+
+if "confirm_new_chat" not in st.session_state:
+    st.session_state.confirm_new_chat = False
+
+if not st.session_state.confirm_new_chat:
+    if st.sidebar.button("🗑️ 清理会话 (开启新对话)", use_container_width=True):
+        st.session_state.confirm_new_chat = True
+        st.rerun()
+else:
+    st.sidebar.warning(
+        "⚠️ **确认清理？**\n\n"
+        "此操作会清除当前 ChatGPT 的对话上下文，"
+        "所有用户（包括 Telegram Bot 端）的对话都会受到影响。"
+    )
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        if st.button("✅ 确认清理", use_container_width=True):
+            st.session_state.confirm_new_chat = False
+            with st.sidebar.spinner("正在重置浏览器会话..."):
+                res = runner.run_coroutine(runner.browser.new_chat()).result()
+                if res["status"] == "success":
+                    st.session_state.messages = []
+                    st.sidebar.success("会话重置成功！")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.sidebar.error(f"重置失败: {res.get('message')}")
+    with col2:
+        if st.button("❌ 取消", use_container_width=True):
+            st.session_state.confirm_new_chat = False
             st.rerun()
-        else:
-            st.sidebar.error(f"重置失败: {res.get('message')}")
 
 # Image Uploader for Image-to-Image / Vision prompts
 st.sidebar.markdown("---")
@@ -197,14 +221,9 @@ if prompt := st.chat_input("输入对话内容，或输入 '帮我画一只奶�
             
     # Process ChatGPT Response
     with st.chat_message("assistant"):
-        # Queue/Lock processing
-        acquired = runner.lock.acquire(blocking=False)
-        if not acquired:
-            with st.info("⏳ 队列繁忙：当前有其他任务正在控制浏览器，已为您排队，请稍候..."):
-                runner.lock.acquire()
-        
         try:
             # Dispatch command and get future
+            # Lock serialization is handled inside browser.send_message() itself
             future = runner.run_coroutine(runner.browser.send_message(prompt, temp_upload_path))
             
             # Display real-time progress counter/spinner
@@ -223,7 +242,6 @@ if prompt := st.chat_input("输入对话内容，或输入 '帮我画一只奶�
             logger.error(f"Failed execution block: {e}", exc_info=True)
             result = {"status": "error", "message": str(e)}
         finally:
-            runner.lock.release()
             # Delete temp uploaded file from local filesystem
             if temp_upload_path and os.path.exists(temp_upload_path):
                 try:
