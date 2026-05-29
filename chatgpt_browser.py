@@ -65,6 +65,22 @@ class ChatGPTBrowser:
         self.playwright = None
         logger.info("Disconnected from browser.")
 
+    def _get_dedup_key(self, src: str) -> str:
+        """Extracts a normalized deduplication key from an image source URL."""
+        if not src:
+            return ""
+        # Remove HTML escapes (e.g. &amp; -> &)
+        normalized = src.replace("&amp;", "&")
+        try:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(normalized)
+            params = urllib.parse.parse_qs(parsed.query)
+            if "id" in params:
+                return params["id"][0]
+        except Exception:
+            pass
+        return normalized
+
     async def download_image(self, img_element, output_path):
         """Downloads an image using the page's fetch context to bypass CORS/cookies."""
         try:
@@ -156,7 +172,7 @@ class ChatGPTBrowser:
                 for img in imgs:
                     src = await img.get_attribute("src") or ""
                     if src:
-                        initial_srcs.add(src)
+                        initial_srcs.add(self._get_dedup_key(src))
             except Exception as e:
                 logger.warning(f"Error capturing initial image sources: {e}")
             logger.info(f"Initial generated DALL-E images: {initial_img_count}, total images on page: {len(initial_srcs)}")
@@ -273,6 +289,7 @@ class ChatGPTBrowser:
             # 6. Extract generated images (check last turn first, fallback to page-wide reverse scan filtered against snapshot)
             downloaded_images = []
             img_index = 1
+            downloaded_srcs = set() # Track already downloaded sources to avoid duplicates
             
             async def try_download_image(img_el):
                 nonlocal img_index
@@ -286,9 +303,16 @@ class ChatGPTBrowser:
                     return False
                     
                 if src.startswith("http") or src.startswith("blob:"):
+                    dedup_key = self._get_dedup_key(src)
+                    # Avoid downloading the same image source multiple times
+                    if dedup_key in downloaded_srcs:
+                        return False
+                    downloaded_srcs.add(dedup_key)
+                    
                     out_filename = f"gen_{int(time.time())}_{img_index}.png"
                     out_path = os.path.join(self.temp_dir, out_filename)
-                    logger.info(f"Found image candidate. Downloading...")
+                    logger.info(f"Found image candidate: alt='{alt}', src='{src[:100]}...'")
+                    logger.info(f"Downloading image to {out_path}...")
                     success = await self.download_image(img_el, out_path)
                     if success:
                         downloaded_images.append(out_path)
@@ -309,13 +333,15 @@ class ChatGPTBrowser:
                 for img in reversed(all_imgs):
                     src = await img.get_attribute("src") or ""
                     alt = await img.get_attribute("alt") or ""
-                    # Ensure it is a newly generated DALL-E image and not in the pre-send snapshot
-                    if src and src not in initial_srcs:
-                        if alt.startswith("Generated image:") or len(alt) > 15:
-                            success = await try_download_image(img)
-                            if success:
-                                logger.info("Successfully matched and downloaded page-wide new image.")
-                                break
+                    if src:
+                        dedup_key = self._get_dedup_key(src)
+                        # Ensure it is a newly generated DALL-E image and not in the pre-send snapshot
+                        if dedup_key not in initial_srcs:
+                            if alt.startswith("Generated image:") or len(alt) > 15:
+                                success = await try_download_image(img)
+                                if success:
+                                    logger.info("Successfully matched and downloaded page-wide new image.")
+                                    break
 
             if not text_response and not downloaded_images:
                 text_response = "[Failed to extract response content]"

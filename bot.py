@@ -132,11 +132,18 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
                     if len(img_paths) == 1:
                         # Single photo
                         with open(img_paths[0], "rb") as photo:
-                            await update.message.reply_photo(photo=photo, caption="🎨 DALL-E 3 生成的图片")
+                            await update.message.reply_photo(
+                                photo=photo, 
+                                caption="🎨 DALL-E 3 生成的图片",
+                                write_timeout=120
+                            )
                     else:
                         # Multiple photos in media group
                         media = [InputMediaPhoto(media=open(p, "rb")) for p in img_paths]
-                        await update.message.reply_media_group(media=media)
+                        await update.message.reply_media_group(
+                            media=media,
+                            write_timeout=120
+                        )
                 else:
                     if "画" in prompt or "draw" in prompt.lower() or "image" in prompt.lower():
                         logger.warning("Generation succeeded but no images were found in the last turn.")
