@@ -88,17 +88,25 @@ class ChatGPTBrowser:
             if not src:
                 return False
 
-            # JS function to fetch image as base64
+            # JS function to fetch image as base64 using a clean iframe to bypass monkey-patched global fetch
             js_code = """
             async (url) => {
-                const response = await fetch(url);
-                const blob = await response.blob();
-                return new Promise((resolve, reject) => {
-                    const reader = new FileReader();
-                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                    reader.onerror = reject;
-                    reader.readAsDataURL(blob);
-                });
+                const iframe = document.createElement('iframe');
+                iframe.style.display = 'none';
+                document.body.appendChild(iframe);
+                try {
+                    const cleanFetch = iframe.contentWindow.fetch;
+                    const response = await cleanFetch(url);
+                    const blob = await response.blob();
+                    return new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                        reader.onerror = reject;
+                        reader.readAsDataURL(blob);
+                    });
+                } finally {
+                    iframe.remove();
+                }
             }
             """
             base64_data = await self.page.evaluate(js_code, src)
@@ -157,7 +165,7 @@ class ChatGPTBrowser:
                     for img in imgs:
                         alt = await img.get_attribute("alt") or ""
                         src = await img.get_attribute("src") or ""
-                        if (src.startswith("http") or src.startswith("blob:")) and (alt.startswith("Generated image:") or len(alt) > 15):
+                        if (src.startswith("http") or src.startswith("blob:")) and alt.startswith("Generated image:"):
                             count += 1
                     return count
                 except Exception as e:
@@ -337,7 +345,7 @@ class ChatGPTBrowser:
                         dedup_key = self._get_dedup_key(src)
                         # Ensure it is a newly generated DALL-E image and not in the pre-send snapshot
                         if dedup_key not in initial_srcs:
-                            if alt.startswith("Generated image:") or len(alt) > 15:
+                            if alt.startswith("Generated image:"):
                                 success = await try_download_image(img)
                                 if success:
                                     logger.info("Successfully matched and downloaded page-wide new image.")
