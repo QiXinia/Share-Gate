@@ -1,0 +1,4 @@
+python-dotenv==1.0.1
+playwright==1.44.0
+python-telegram-bot==21.3
+pillow==10.3.0
