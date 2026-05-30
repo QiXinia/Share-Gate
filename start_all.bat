@@ -2,31 +2,16 @@
 chcp 65001 >nul
 title WebGPT2API
 
-echo ============================================
-echo   WebGPT2API
-echo ============================================
-echo.
+cd /d "%~dp0"
 
-echo [1/3] Starting Chrome...
-start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="C:\Users\86150\Chrome_Hermes_Profile" --remote-debugging-port=9222 "https://chatgpt.com"
+echo Starting ngrok...
+start "ngrok" "C:\Users\86150\Desktop\黑魔法\内网穿透\ngrok.exe" http --url=main-faithful-lion.ngrok-free.app 8501 --host-header="localhost:8501"
 
-echo       Waiting 8s for Chrome...
-timeout /t 8 /nobreak >nul
+if not exist venv\Scripts\python.exe (
+    echo [ERROR] Virtual environment not found at 'venv'!
+    echo Running with system default python...
+    python run_all.py
+) else (
+    venv\Scripts\python.exe run_all.py
+)
 
-echo [2/3] Starting Telegram Bot...
-start "Bot" cmd /k "cd /d d:\pycharmProject\webgpt2api && venv\Scripts\python.exe bot.py"
-
-timeout /t 2 /nobreak >nul
-
-echo [3/3] Starting Streamlit...
-start "Streamlit" cmd /k "cd /d d:\pycharmProject\webgpt2api && venv\Scripts\streamlit.exe run app_streamlit.py"
-
-echo.
-echo ============================================
-echo   All services started!
-echo   - Chrome: https://chatgpt.com (port 9222)
-echo   - Telegram Bot: running
-echo   - Streamlit: http://localhost:8501
-echo ============================================
-echo.
-pause >nul
