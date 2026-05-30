@@ -35,11 +35,21 @@ class BrowserRunner:
 
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
-        try:
-            self.loop.run_until_complete(self.browser.start())
-            logger.info("Browser connection initialized successfully inside background thread.")
-        except Exception as e:
-            logger.error(f"Error starting browser in background loop: {e}")
+        # Retry connection up to 10 times (total ~30s) to handle
+        # the race condition where Chrome CDP port isn't ready yet.
+        max_retries = 10
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.loop.run_until_complete(self.browser.start())
+                logger.info("Browser connection initialized successfully inside background thread.")
+                break
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(f"Browser connect attempt {attempt}/{max_retries} failed: {e}. Retrying in 3s...")
+                    import time
+                    time.sleep(3)
+                else:
+                    logger.error(f"Failed to connect to browser after {max_retries} attempts: {e}")
         self.loop.run_forever()
 
     def run_coroutine(self, coro):

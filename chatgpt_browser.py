@@ -74,14 +74,27 @@ class ChatGPTBrowser:
 
     async def start(self):
         """Connect to the Chrome instance via CDP and find/open the ChatGPT page."""
-        if self.playwright is None:
-            self.playwright = await async_playwright().start()
+        # Always create a fresh playwright instance to avoid stale state from failed attempts
+        if self.playwright is not None:
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
+            self.playwright = None
+
+        self.playwright = await async_playwright().start()
 
         logger.info(f"Connecting to browser via CDP: {self.cdp_url}")
         try:
             self.browser = await self.playwright.chromium.connect_over_cdp(self.cdp_url)
         except Exception as e:
             logger.error(f"Failed to connect to CDP: {e}")
+            # Clean up so the next retry attempt starts fresh
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
+            self.playwright = None
             raise RuntimeError(
                 f"Could not connect to Chrome debugging port at {self.cdp_url}. "
                 "Please make sure Chrome is started with --remote-debugging-port=9222"
