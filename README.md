@@ -1,6 +1,27 @@
-# ChatGPT 亲友共享与对话隔离助手 (Telegram Bot & Streamlit Web UI)
+<div align="center">
 
-这是一个通过 Playwright 自动化接管本地已登录 ChatGPT 网页端的浏览器，旨在**与好友或家人安全共享同一个 ChatGPT 账号（如 Plus 账号），并实现对话内容完全隔离**的私密共享系统。
+<img src="resources/banner.png" alt="ChatGPT-Share-Gate Banner" width="100%"/>
+
+<br/>
+
+[![License](https://img.shields.io/github/license/tfboy1/webgpt2api?style=for-the-badge&color=blue)](LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/tfboy1/webgpt2api?style=for-the-badge&logo=github&color=yellow)](https://github.com/tfboy1/webgpt2api/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/tfboy1/webgpt2api?style=for-the-badge&logo=git&color=orange)](https://github.com/tfboy1/webgpt2api/network/members)
+[![爱发电](https://img.shields.io/badge/爱发电-Support%20Me-FF69B4?style=for-the-badge&logo=buy-me-a-coffee&logoColor=white)](https://www.ifdian.net/item/1a20ed042f0711f1865a52540025c377)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-☕-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://www.creem.io/payment/prod_1yc40mIhKwwrc7iqFOG9G2)
+
+<br/>
+
+[![简体中文](https://img.shields.io/badge/简体中文-当前语言-red?style=flat-square)](#)
+[![English](https://img.shields.io/badge/English-README-blue?style=flat-square)](docs/README_EN.md)
+[![日本語](https://img.shields.io/badge/日本語-README-blue?style=flat-square)](docs/README_JA.md)
+
+<br/>
+
+一个通过 Playwright 自动化接管本地已登录 ChatGPT 网页端的浏览器，<br/>
+旨在**与好友或家人安全共享同一个 ChatGPT 账号（如 Plus 账号），并实现对话内容完全隔离**的私密共享系统。
+
+</div>
 
 ### 💡 核心设计初衷
 许多人希望能与好友共用一个 ChatGPT Plus 账号以分摊成本或共享作图功能。然而，直接多人在同一个浏览器或 App 上共用账号存在两大痛点：
