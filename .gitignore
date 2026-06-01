@@ -1,2 +1,14 @@
-/venv
-/temp
+# Python 虚拟环境与缓存
+/venv/
+.venv/
+__pycache__/
+*.pyc
+
+# 密钥与个人配置文件 (严禁上传)
+.env
+
+# 运行产生的日志与临时目录
+/bot.log
+/temp/
+/chrome-dev-profile/
+*.diff
