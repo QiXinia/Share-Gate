@@ -1,10 +1,10 @@
 @echo off
-title WebGPT2API
+title ChatGPT-Share-Gate
 
 cd /d "%~dp0"
 
 echo ============================================
-echo   WebGPT2API Environment ^& Dependency Setup
+echo   ChatGPT-Share-Gate Environment ^& Setup
 echo ============================================
 echo.
 

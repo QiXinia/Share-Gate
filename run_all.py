@@ -106,7 +106,7 @@ def find_chrome():
 
 def main():
     print("============================================")
-    print("  Unified WebGPT2API Services Starter")
+    print("  ChatGPT Share Gate Services Starter")
     print("============================================")
     print()
 
