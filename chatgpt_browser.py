@@ -35,8 +35,15 @@ class _FileLock:
         try:
             if sys.platform == "win32":
                 import msvcrt
-                # LK_LOCK blocks until the lock is available
-                msvcrt.locking(self._fd, msvcrt.LK_LOCK, 1)
+                while True:
+                    try:
+                        msvcrt.locking(self._fd, msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError as e:
+                        if e.errno in (13, 36):
+                            time.sleep(0.5)
+                        else:
+                            raise
             else:
                 import fcntl
                 fcntl.flock(self._fd, fcntl.LOCK_EX)

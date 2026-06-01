@@ -283,8 +283,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 def main():
-    if not config.TELEGRAM_BOT_TOKEN:
-        logger.critical("TELEGRAM_BOT_TOKEN environment variable not set in .env!")
+    if not config.TELEGRAM_BOT_TOKEN or config.TELEGRAM_BOT_TOKEN.strip() in ("", "YOUR_BOT_TOKEN_HERE"):
+        logger.critical("TELEGRAM_BOT_TOKEN environment variable not set or invalid placeholder in .env!")
         return
 
     logger.info("Initializing Telegram Bot...")
