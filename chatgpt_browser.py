@@ -194,27 +194,27 @@ class ChatGPTBrowser:
             logger.error(f"Error downloading image: {e}")
             return False
 
-    async def send_message(self, prompt, image_path=None, file_paths=None, timeout_minutes=6):
+    async def send_message(self, prompt, image_path=None, file_paths=None, features=None, timeout_minutes=6):
         """Sends a message to ChatGPT, handles image/file uploads if present, and returns the response.
 
         Uses both an asyncio.Lock (intra-process) and a file lock (cross-process)
         to ensure only one caller drives the browser at any given time.
         """
         async with self.lock:
-            return await self._send_message_inner(prompt, image_path, file_paths, timeout_minutes)
+            return await self._send_message_inner(prompt, image_path, file_paths, features, timeout_minutes)
 
-    async def _send_message_inner(self, prompt, image_path=None, file_paths=None, timeout_minutes=6):
+    async def _send_message_inner(self, prompt, image_path=None, file_paths=None, features=None, timeout_minutes=6):
         """Inner implementation of send_message, called while holding the asyncio lock."""
         # Acquire cross-process file lock in a thread so we don't block the event loop
         loop = asyncio.get_running_loop()
         lock_ctx = self._file_lock.acquire()
         await loop.run_in_executor(None, lock_ctx.__enter__)
         try:
-            return await self._do_send_message(prompt, image_path, file_paths, timeout_minutes)
+            return await self._do_send_message(prompt, image_path, file_paths, features, timeout_minutes)
         finally:
             await loop.run_in_executor(None, lock_ctx.__exit__, None, None, None)
 
-    async def _do_send_message(self, prompt, image_path=None, file_paths=None, timeout_minutes=6):
+    async def _do_send_message(self, prompt, image_path=None, file_paths=None, features=None, timeout_minutes=6):
         """Core send-message logic, called while holding both locks."""
         # Ensure browser is connected
         try:
@@ -249,6 +249,57 @@ class ChatGPTBrowser:
             textarea = self.page.locator("#prompt-textarea")
             await textarea.wait_for(state="visible", timeout=10000)
             await textarea.click()
+
+            # 2.5 Handle feature toggles (Thinking, Web Search, Deep Research) if requested
+            if features:
+                logger.info(f"Aligning browser features: {features}")
+                for feature_name, target_state in features.items():
+                    if feature_name not in ["thinking", "webSearch", "deepResearch"]:
+                        continue
+                    
+                    label_map = {
+                        "thinking": ["Thinking", "思考"],
+                        "webSearch": ["Web search", "网络搜索"],
+                        "deepResearch": ["Deep research", "深度搜索"]
+                    }
+                    keywords = label_map[feature_name]
+                    
+                    # 1. Open menu
+                    plus_btn = self.page.locator('button[data-testid="composer-plus-btn"], button[aria-label="Add files and more"]').first
+                    if await plus_btn.count() == 0:
+                        logger.warning("Composer plus button not found in browser, skipping toggle.")
+                        continue
+                        
+                    await plus_btn.click()
+                    await asyncio.sleep(0.8)
+                    
+                    # 2. Inspect state and click if different
+                    menu_items = await self.page.locator('[role="menuitemradio"]').all()
+                    target_item = None
+                    for item in menu_items:
+                        text = await item.inner_text()
+                        if any(kw.lower() in text.lower() for kw in keywords):
+                            target_item = item
+                            break
+                            
+                    if target_item:
+                        aria_checked = await target_item.get_attribute("aria-checked")
+                        data_state = await target_item.get_attribute("data-state")
+                        current_state = (aria_checked == "true") or (data_state == "checked")
+                        
+                        logger.info(f"Browser feature '{feature_name}': current={current_state}, target={target_state}")
+                        if current_state != target_state:
+                            logger.info(f"Clicking menu item to toggle '{feature_name}' to {target_state}")
+                            await target_item.click()
+                            await asyncio.sleep(0.8) # Wait for click and menu auto-dismiss
+                        else:
+                            # It is already correct, press Escape to dismiss the menu
+                            await self.page.keyboard.press("Escape")
+                            await asyncio.sleep(0.3)
+                    else:
+                        # Item not found, press Escape
+                        await self.page.keyboard.press("Escape")
+                        await asyncio.sleep(0.3)
             
             # If prompt is empty but we uploaded files, provide a default prompt based on file types
             if not prompt and file_paths:
@@ -373,6 +424,35 @@ class ChatGPTBrowser:
             text_response = ""
             last_assistant = self.page.locator('.agent-turn, [data-message-author-role="assistant"]').last
             
+            # Extract thinking/reasoning process if present
+            thinking_text = ""
+            try:
+                # 1. Look for details element
+                details_el = last_assistant.locator('details').first
+                if await details_el.count() > 0:
+                    thinking_text = await details_el.inner_text()
+                else:
+                    # 2. Look for element with data-testid or class containing 'thought'
+                    thought_el = last_assistant.locator('[data-testid="thought-process"], [class*="thought"], [class*="thinking"], [class*="reasoning"]').first
+                    if await thought_el.count() > 0:
+                        text_content = await thought_el.inner_text()
+                        if text_content:
+                            thinking_text = text_content
+            except Exception as e:
+                logger.warning(f"Error checking for thinking block: {e}")
+
+            # Extract search queries if present
+            search_text = ""
+            try:
+                search_el = last_assistant.locator('[data-testid*="search"], [class*="search"]').first
+                if await search_el.count() > 0:
+                    text_content = await search_el.inner_text()
+                    if text_content and ("search" in text_content.lower() or "搜索" in text_content):
+                        if len(text_content) < 300:
+                            search_text = text_content
+            except Exception as e:
+                logger.warning(f"Error checking for search block: {e}")
+
             # Try 1: last_assistant's .markdown
             markdown_el = last_assistant.locator('.markdown').first
             if await markdown_el.count() > 0:
@@ -392,10 +472,29 @@ class ChatGPTBrowser:
                         if await general_md.count() > 0:
                             text_response = await general_md.inner_text()
 
+            # Format final response combining thinking process, search process, and text
+            final_formatted = ""
+            if thinking_text:
+                thinking_text = thinking_text.strip()
+                # Clean up header from innerText if present (e.g. "Thought\n" or "已思考")
+                lines = thinking_text.split('\n')
+                if len(lines) > 1 and ("thought" in lines[0].lower() or "思考" in lines[0]):
+                    thinking_text = "\n".join(lines[1:])
+                final_formatted += f"<details class='thought-details bg-purple-500/5 dark:bg-purple-950/20 p-3 rounded-xl border border-purple-500/10 dark:border-purple-500/20 mb-3'><summary class='cursor-pointer text-xs font-semibold text-purple-600 dark:text-purple-400 select-none'>💭 思考过程</summary><div class='text-xs text-gray-600 dark:text-gray-300 mt-2 whitespace-pre-wrap leading-relaxed'>{thinking_text}</div></details>\n\n"
+                
+            if search_text:
+                search_text = search_text.strip()
+                lines = search_text.split('\n')
+                display_search = lines[0]
+                final_formatted += f"<div class='search-indicator bg-blue-50/5 dark:bg-blue-950/20 p-2.5 rounded-xl border border-blue-500/10 dark:border-blue-500/20 text-xs text-blue-600 dark:text-blue-400 mb-3 flex items-center gap-2 select-none'><i class='fa-solid fa-globe animate-spin' style='animation-duration: 6s;'></i> <span>{display_search}</span></div>\n\n"
+
             if text_response:
                 text_response = text_response.strip()
                 if text_response.lower() == "edit":
                     text_response = ""
+                final_formatted += text_response
+            else:
+                final_formatted += "[Failed to extract response content]"
 
             # 6. Extract generated images (check last turn first, fallback to page-wide reverse scan filtered against snapshot)
             downloaded_images = []
@@ -454,13 +553,9 @@ class ChatGPTBrowser:
                                     logger.info("Successfully matched and downloaded page-wide new image.")
                                     break
 
-            if not text_response and not downloaded_images:
-                text_response = "[Failed to extract response content]"
-                logger.warning("Could not extract assistant message text or images.")
-
             return {
                 "status": "success",
-                "text": text_response,
+                "text": final_formatted,
                 "images": downloaded_images
             }
 

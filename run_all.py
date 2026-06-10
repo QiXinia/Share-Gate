@@ -212,19 +212,19 @@ def main():
 
     time.sleep(2)
 
-    print("[4/4] Starting Streamlit...")
-    streamlit_process = None
+    print("[4/4] Starting Web Server...")
+    web_process = None
     try:
-        streamlit_process = subprocess.Popen(
-            [streamlit_exe, "run", "app_streamlit.py"],
+        web_process = subprocess.Popen(
+            [python_exe, "web_server.py"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=env
         )
-        t_streamlit = threading.Thread(target=stream_output, args=(streamlit_process, "Streamlit"), daemon=True)
-        t_streamlit.start()
+        t_web = threading.Thread(target=stream_output, args=(web_process, "WebServer"), daemon=True)
+        t_web.start()
     except Exception as e:
-        print(f"❌ Failed to start Streamlit: {e}")
+        print(f"❌ Failed to start Web Server: {e}")
 
     print()
     print("============================================")
@@ -241,8 +241,8 @@ def main():
             if bot_process and bot_process.poll() is not None:
                 print("⚠️ Telegram Bot process terminated unexpectedly.")
                 break
-            if streamlit_process and streamlit_process.poll() is not None:
-                print("⚠️ Streamlit process terminated unexpectedly.")
+            if web_process and web_process.poll() is not None:
+                print("⚠️ Web Server process terminated unexpectedly.")
                 break
             if ngrok_process and ngrok_process.poll() is not None and not ngrok_warned_dead:
                 print("⚠️ Ngrok tunnel process terminated unexpectedly.")
@@ -254,9 +254,9 @@ def main():
         if bot_process and bot_process.poll() is None:
             print("Terminating Telegram Bot...")
             bot_process.terminate()
-        if streamlit_process and streamlit_process.poll() is None:
-            print("Terminating Streamlit...")
-            streamlit_process.terminate()
+        if web_process and web_process.poll() is None:
+            print("Terminating Web Server...")
+            web_process.terminate()
         if ngrok_process and ngrok_process.poll() is None:
             print("Terminating Ngrok...")
             ngrok_process.terminate()
@@ -267,11 +267,11 @@ def main():
                 bot_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 bot_process.kill()
-        if streamlit_process:
+        if web_process:
             try:
-                streamlit_process.wait(timeout=5)
+                web_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                streamlit_process.kill()
+                web_process.kill()
         if ngrok_process:
             try:
                 ngrok_process.wait(timeout=5)
