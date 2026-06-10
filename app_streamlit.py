@@ -67,6 +67,31 @@ def load_image_to_memory(file_path):
         logger.error(f"Failed to load image {file_path} to memory: {e}")
         return None
 
+def format_file_size(size_in_bytes):
+    if size_in_bytes < 1024:
+        return f"{size_in_bytes} B"
+    elif size_in_bytes < 1024 * 1024:
+        return f"{size_in_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_in_bytes / (1024 * 1024):.1f} MB"
+
+def get_file_icon(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ('.png', '.jpg', '.jpeg', '.webp', '.gif'):
+        return "🖼️"
+    elif ext in ('.pdf'):
+        return "📕"
+    elif ext in ('.doc', '.docx'):
+        return "📝"
+    elif ext in ('.xls', '.xlsx', '.csv'):
+        return "📊"
+    elif ext in ('.txt', '.md', '.py', '.js', '.html', '.css', '.json'):
+        return "📄"
+    elif ext in ('.zip', '.rar', '.7z', '.tar', '.gz'):
+        return "📦"
+    else:
+        return "📁"
+
 # 1. Page Configuration & Aesthetic Style injection
 st.set_page_config(
     page_title="ChatGPT 网页控制台",
@@ -106,6 +131,38 @@ st.markdown("""
     .header-subtitle {
         color: #a6adc8;
         font-size: 1.1rem;
+    }
+
+    /* Style file uploader to be sleek and compact like ChatGPT */
+    [data-testid="stFileUploader"] {
+        border: 1px dashed rgba(255, 255, 255, 0.15) !important;
+        border-radius: 12px !important;
+        padding: 10px !important;
+        background-color: rgba(255, 255, 255, 0.02) !important;
+        transition: border-color 0.3s;
+    }
+    [data-testid="stFileUploader"]:hover {
+        border-color: #89b4fa !important;
+    }
+
+    /* Custom premium styling for chat bubbles */
+    [data-testid="stChatMessage"] {
+        border-radius: 12px !important;
+        padding: 1.25rem !important;
+        margin-bottom: 1rem !important;
+        border: 1px solid rgba(255, 255, 255, 0.05) !important;
+        background-color: rgba(255, 255, 255, 0.02) !important;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+    }
+    
+    [data-testid="stChatMessage"][data-user="true"] {
+        background-color: rgba(137, 180, 250, 0.08) !important;
+        border-left: 4px solid #89b4fa !important;
+    }
+    
+    [data-testid="stChatMessage"][data-user="false"] {
+        background-color: rgba(203, 166, 247, 0.05) !important;
+        border-left: 4px solid #cba6f7 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -178,18 +235,6 @@ else:
             st.session_state.confirm_new_chat = False
             st.rerun()
 
-# Image Uploader for Image-to-Image / Vision prompts
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🖼️ 图生图分析 (Vision)")
-uploaded_file = st.sidebar.file_uploader(
-    "上传单张图片，并在下方对话框中输入你的指令：",
-    type=["png", "jpg", "jpeg"]
-)
-if uploaded_file is not None:
-    st.sidebar.image(uploaded_file, caption="待上传图片预览", use_column_width=True)
-
-
-
 # 4. Chat messages container & renderer
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -199,42 +244,166 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg.get("text"):
             st.markdown(msg["text"])
+        
+        # Render files/images if present in user message
+        if msg.get("files"):
+            img_files = [f for f in msg["files"] if f["is_image"]]
+            doc_files = [f for f in msg["files"] if not f["is_image"]]
+            
+            if img_files:
+                for img in img_files:
+                    st.image(img["bytes"], caption=img["name"], width=300)
+            
+            if doc_files:
+                chips_html = '<div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; margin-bottom: 8px;">'
+                for doc in doc_files:
+                    icon = get_file_icon(doc["name"])
+                    size_str = format_file_size(len(doc["bytes"]))
+                    chips_html += f"""
+                    <div style="
+                        display: flex;
+                        align-items: center;
+                        background-color: #1e1e1e;
+                        border: 1px solid rgba(255, 255, 255, 0.08);
+                        border-radius: 8px;
+                        padding: 6px 12px;
+                        gap: 8px;
+                        max-width: 200px;
+                    ">
+                        <span style="font-size: 1.2rem;">{icon}</span>
+                        <div style="display: flex; flex-direction: column; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                            <span style="font-size: 0.8rem; color: #ececec; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">{doc["name"]}</span>
+                            <span style="font-size: 0.65rem; color: #8a8a8a;">{size_str}</span>
+                        </div>
+                    </div>
+                    """
+                chips_html += '</div>'
+                st.markdown(chips_html, unsafe_allow_html=True)
+
         if msg.get("images"):
             for img_bytes in msg["images"]:
-                st.image(img_bytes, caption="图片内容")
+                st.image(img_bytes, caption="图片内容", width=300)
+
+# ChatGPT Style attachment upload area on the main chat panel
+st.markdown("---")
+col_upload_title, _ = st.columns([2, 1])
+with col_upload_title:
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+        <span style="font-size: 1.05rem; font-weight: 600; color: #ececec;">📎 附件上传 (支持图片及各类文档)</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+uploaded_files = st.file_uploader(
+    "上传附件",
+    type=None,
+    accept_multiple_files=True,
+    label_visibility="collapsed"
+)
+
+# Render attachment preview chips if files are uploaded
+if uploaded_files:
+    chips_html = '<div class="chatgpt-attachments-container" style="display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; margin-bottom: 12px;">'
+    for f in uploaded_files:
+        icon = get_file_icon(f.name)
+        size_str = format_file_size(f.size)
+        chips_html += f"""
+        <div style="
+            display: flex;
+            align-items: center;
+            background-color: #212121;
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            border-radius: 10px;
+            padding: 8px 12px;
+            gap: 10px;
+            max-width: 250px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        ">
+            <span style="font-size: 1.4rem; line-height: 1;">{icon}</span>
+            <div style="display: flex; flex-direction: column; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                <span style="font-size: 0.85rem; color: #f9f9f9; font-weight: 500; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">{f.name}</span>
+                <span style="font-size: 0.7rem; color: #9b9b9b;">{size_str}</span>
+            </div>
+        </div>
+        """
+    chips_html += '</div>'
+    st.markdown(chips_html, unsafe_allow_html=True)
 
 # 5. Handle chat inputs
 if prompt := st.chat_input("输入对话内容，或输入 '帮我画一只奶龙' 进行绘图..."):
-    # Append user message with text & optional uploaded image preview bytes
+    # Append user message with text & optional uploaded image/file preview bytes
     user_msg = {"role": "user", "text": prompt}
     
-    temp_upload_path = None
-    user_img_bytes = None
-    if uploaded_file is not None:
-        # Save file to disk temporarily for Playwright input element submission
-        suffix = os.path.splitext(uploaded_file.name)[1]
-        temp_filename = f"st_upload_{int(time.time())}{suffix}"
-        temp_upload_path = os.path.join(config.TEMP_DIR, temp_filename)
-        with open(temp_upload_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        user_img_bytes = uploaded_file.getvalue()
-        user_msg["images"] = [user_img_bytes]
+    temp_file_paths = []
+    user_files = []
+    
+    if uploaded_files:
+        for index, uploaded_file in enumerate(uploaded_files):
+            # Save file to disk temporarily for Playwright input element submission
+            # Preserve original filename for ChatGPT file analysis
+            original_name = uploaded_file.name
+            safe_name = os.path.basename(original_name)
+            temp_filename = f"st_upload_{index}_{int(time.time())}_{safe_name}"
+            temp_path = os.path.join(config.TEMP_DIR, temp_filename)
+            
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            temp_file_paths.append(temp_path)
+            
+            is_image = uploaded_file.name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif'))
+            user_files.append({
+                "name": uploaded_file.name,
+                "bytes": uploaded_file.getvalue(),
+                "is_image": is_image
+            })
+            
+        user_msg["files"] = user_files
 
     st.session_state.messages.append(user_msg)
     
     # Render user message immediately
     with st.chat_message("user"):
         st.markdown(prompt)
-        if user_img_bytes:
-            st.image(user_img_bytes, caption="已上传图片")
+        if user_files:
+            img_files = [f for f in user_files if f["is_image"]]
+            doc_files = [f for f in user_files if not f["is_image"]]
+            
+            if img_files:
+                for img in img_files:
+                    st.image(img["bytes"], caption=img["name"], width=300)
+            if doc_files:
+                chips_html = '<div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; margin-bottom: 8px;">'
+                for doc in doc_files:
+                    icon = get_file_icon(doc["name"])
+                    size_str = format_file_size(len(doc["bytes"]))
+                    chips_html += f"""
+                    <div style="
+                        display: flex;
+                        align-items: center;
+                        background-color: #1e1e1e;
+                        border: 1px solid rgba(255, 255, 255, 0.08);
+                        border-radius: 8px;
+                        padding: 6px 12px;
+                        gap: 8px;
+                        max-width: 200px;
+                    ">
+                        <span style="font-size: 1.2rem;">{icon}</span>
+                        <div style="display: flex; flex-direction: column; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                            <span style="font-size: 0.8rem; color: #ececec; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">{doc["name"]}</span>
+                            <span style="font-size: 0.65rem; color: #8a8a8a;">{size_str}</span>
+                        </div>
+                    </div>
+                    """
+                chips_html += '</div>'
+                st.markdown(chips_html, unsafe_allow_html=True)
             
     # Process ChatGPT Response
     with st.chat_message("assistant"):
         try:
             # Dispatch command and get future
             # Lock serialization is handled inside browser.send_message() itself
-            future = runner.run_coroutine(runner.browser.send_message(prompt, temp_upload_path))
+            future = runner.run_coroutine(runner.browser.send_message(prompt, file_paths=temp_file_paths))
             
             # Display real-time progress counter/spinner
             progress_placeholder = st.empty()
@@ -252,12 +421,14 @@ if prompt := st.chat_input("输入对话内容，或输入 '帮我画一只奶�
             logger.error(f"Failed execution block: {e}", exc_info=True)
             result = {"status": "error", "message": str(e)}
         finally:
-            # Delete temp uploaded file from local filesystem
-            if temp_upload_path and os.path.exists(temp_upload_path):
-                try:
-                    os.remove(temp_upload_path)
-                except Exception as e:
-                    logger.warning(f"Error removing temp upload file {temp_upload_path}: {e}")
+            # Delete temp uploaded files from local filesystem
+            if temp_file_paths:
+                for path in temp_file_paths:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception as e:
+                            logger.warning(f"Error removing temp upload file {path}: {e}")
 
         # Handle successful response
         if result.get("status") == "success":
@@ -281,7 +452,7 @@ if prompt := st.chat_input("输入对话内容，或输入 '帮我画一只奶�
                 st.markdown(response_text)
             
             for img_bytes in assistant_images:
-                st.image(img_bytes, caption="DALL-E 3 生成的图片")
+                st.image(img_bytes, caption="DALL-E 3 生成的图片", width=500)
 
             # Store assistant response to session state messages list
             assistant_msg = {"role": "assistant", "text": response_text}

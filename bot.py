@@ -55,7 +55,7 @@ async def send_long_message(update: Update, text: str):
             chunk = text[i:i + limit]
             await update.message.reply_text(chunk)
 
-async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, image_path: str = None):
+async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, image_path: str = None, file_paths: list[str] = None):
     """Main orchestrator for processing chat/image requests sequentially via browser automation."""
     global queue_counter
     
@@ -101,10 +101,10 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
 
         reporter_task = asyncio.create_task(progress_reporter())
 
-        logger.info(f"Processing request: prompt='{prompt[:50]}', image={image_path}")
+        logger.info(f"Processing request: prompt='{prompt[:50]}', image={image_path}, files={file_paths}")
         try:
             # Lock is now managed inside browser.send_message() itself
-            result = await browser.send_message(prompt, image_path)
+            result = await browser.send_message(prompt, image_path=image_path, file_paths=file_paths)
         finally:
             # Always ensure reporter task is stopped cleanly
             stop_progress = True
@@ -154,6 +154,15 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
                 except Exception as e:
                     logger.warning(f"Failed to remove temp upload image {image_path}: {e}")
 
+            # Clean up other temporary uploaded files if present
+            if file_paths:
+                for f_path in file_paths:
+                    if os.path.exists(f_path):
+                        try:
+                            os.remove(f_path)
+                        except Exception as e:
+                            logger.warning(f"Failed to remove temp upload file {f_path}: {e}")
+
             # Clean up generated images from local disk
             for img_p in img_paths:
                 if os.path.exists(img_p):
@@ -196,6 +205,24 @@ async def on_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Queue up the request
     asyncio.create_task(handle_request(update, context, prompt=caption, image_path=local_path))
+
+async def on_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggered when user sends a general document or file (with or without caption)."""
+    doc = update.message.document
+    doc_file = await doc.get_file()
+    caption = update.message.caption or ""
+    
+    # Save the document to temporary location using its original filename to preserve extension
+    original_name = doc.file_name or "document"
+    safe_name = os.path.basename(original_name)
+    temp_filename = f"upload_{update.message.message_id}_{int(asyncio.get_event_loop().time())}_{safe_name}"
+    local_path = os.path.join(config.TEMP_DIR, temp_filename)
+    
+    await doc_file.download_to_drive(local_path)
+    logger.info(f"Downloaded user document to {local_path}")
+    
+    # Queue up the request
+    asyncio.create_task(handle_request(update, context, prompt=caption, file_paths=[local_path]))
 
 async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to start a fresh ChatGPT conversation session.
@@ -310,6 +337,7 @@ def main():
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document_message))
 
     # Initialize browser and commands on startup
     async def on_startup(application):

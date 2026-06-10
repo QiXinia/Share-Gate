@@ -194,27 +194,27 @@ class ChatGPTBrowser:
             logger.error(f"Error downloading image: {e}")
             return False
 
-    async def send_message(self, prompt, image_path=None, timeout_minutes=6):
-        """Sends a message to ChatGPT, handles image uploads if present, and returns the response.
+    async def send_message(self, prompt, image_path=None, file_paths=None, timeout_minutes=6):
+        """Sends a message to ChatGPT, handles image/file uploads if present, and returns the response.
 
         Uses both an asyncio.Lock (intra-process) and a file lock (cross-process)
         to ensure only one caller drives the browser at any given time.
         """
         async with self.lock:
-            return await self._send_message_inner(prompt, image_path, timeout_minutes)
+            return await self._send_message_inner(prompt, image_path, file_paths, timeout_minutes)
 
-    async def _send_message_inner(self, prompt, image_path=None, timeout_minutes=6):
+    async def _send_message_inner(self, prompt, image_path=None, file_paths=None, timeout_minutes=6):
         """Inner implementation of send_message, called while holding the asyncio lock."""
         # Acquire cross-process file lock in a thread so we don't block the event loop
         loop = asyncio.get_running_loop()
         lock_ctx = self._file_lock.acquire()
         await loop.run_in_executor(None, lock_ctx.__enter__)
         try:
-            return await self._do_send_message(prompt, image_path, timeout_minutes)
+            return await self._do_send_message(prompt, image_path, file_paths, timeout_minutes)
         finally:
             await loop.run_in_executor(None, lock_ctx.__exit__, None, None, None)
 
-    async def _do_send_message(self, prompt, image_path=None, timeout_minutes=6):
+    async def _do_send_message(self, prompt, image_path=None, file_paths=None, timeout_minutes=6):
         """Core send-message logic, called while holding both locks."""
         # Ensure browser is connected
         try:
@@ -224,26 +224,36 @@ class ChatGPTBrowser:
             return {"status": "error", "message": f"Connection error: {e}"}
 
         try:
-            # 1. Handle file upload for Image-to-Image if image_path is provided
-            if image_path and os.path.exists(image_path):
-                logger.info(f"Uploading image: {image_path}")
-                # Look for hidden file inputs
-                file_input = self.page.locator('input[type="file"]').first
-                await file_input.wait_for(state="attached", timeout=5000)
-                await file_input.set_input_files(image_path)
-                
-                # Give it a few seconds to finish uploading and rendering in the DOM
-                logger.info("Waiting for image upload to process...")
-                await asyncio.sleep(4)
+            # Normalize inputs: combine image_path into file_paths if provided
+            if not file_paths:
+                file_paths = []
+            if image_path:
+                if image_path not in file_paths:
+                    file_paths.append(image_path)
+
+            # 1. Handle file upload for Image/Files if file_paths are provided
+            if file_paths:
+                valid_paths = [p for p in file_paths if os.path.exists(p)]
+                if valid_paths:
+                    logger.info(f"Uploading files: {valid_paths}")
+                    # Look for hidden file inputs
+                    file_input = self.page.locator('input[type="file"]').first
+                    await file_input.wait_for(state="attached", timeout=5000)
+                    await file_input.set_input_files(valid_paths)
+                    
+                    # Give it a few seconds to finish uploading and rendering in the DOM
+                    logger.info("Waiting for file upload to process...")
+                    await asyncio.sleep(5)
 
             # 2. Locate prompt textarea and fill it
             textarea = self.page.locator("#prompt-textarea")
             await textarea.wait_for(state="visible", timeout=10000)
             await textarea.click()
             
-            # If prompt is empty but we uploaded an image, provide a default prompt
-            if not prompt and image_path:
-                prompt = "请分析这张图片"
+            # If prompt is empty but we uploaded files, provide a default prompt based on file types
+            if not prompt and file_paths:
+                has_non_img = any(not p.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')) for p in file_paths)
+                prompt = "请分析这些文件" if has_non_img else "请分析这些图片"
             elif not prompt:
                 prompt = "Hello"
 
