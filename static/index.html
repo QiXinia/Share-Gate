@@ -163,8 +163,23 @@
                 </button>
             </div>
 
+        <!-- AI Platform Switcher (only shown when more than one platform is enabled) -->
+        <div v-if="enabledPlatforms.length > 1" class="px-3.5 pt-2 pb-2">
+            <div class="flex bg-[#ececec]/60 dark:bg-white/5 rounded-lg p-0.5 gap-0.5">
+                <button v-for="p in enabledPlatforms" :key="p"
+                        @click="switchPlatform(p)"
+                        :title="platformLabels[p]"
+                        :class="currentPlatform === p
+                            ? 'bg-white dark:bg-white/15 text-black dark:text-white shadow-sm'
+                            : 'text-[#5f5f5f] dark:text-textMuted hover:text-black dark:hover:text-white'"
+                        class="flex-1 text-xs font-medium rounded-md px-2 py-1.5 transition">
+                    <i :class="p === 'gemini' ? 'fa-solid fa-wand-magic-sparkles' : 'fa-regular fa-comments'" class="mr-1"></i>{{ platformLabels[p] || p }}
+                </button>
+            </div>
+        </div>
+
         <!-- New Chat Button -->
-        <div class="px-3.5 pb-2">
+        <div class="px-3.5 pb-2" :class="enabledPlatforms.length > 1 ? 'pt-0' : 'pt-2'">
             <button @click="createNewSession" class="w-full flex items-center justify-between bg-[#ececec]/60 hover:bg-[#ececec]/90 dark:bg-transparent dark:border dark:border-white/20 dark:hover:border-white/40 text-[#0d0d0d] dark:text-textColor text-sm font-medium rounded-lg px-3.5 py-2.5 hover:bg-black/5 dark:hover:bg-white/5 transition duration-200">
                 <div class="flex items-center gap-2.5">
                     <i class="fa-regular fa-edit text-sm"></i>
@@ -375,7 +390,7 @@
                                             <i class="fa-solid fa-chevron-right text-[10px] text-gray-400"></i>
                                         </button>
                                     </div>
-                                    <div class="py-1 border-b border-black/5 dark:border-white/5">
+                                    <div v-if="currentPlatform === 'chatgpt'" class="py-1 border-b border-black/5 dark:border-white/5">
                                         <button @click="toggleFeature('createImage')" class="w-full flex items-center justify-between px-3.5 py-2 hover:bg-black/5 dark:hover:bg-white/5 transition text-left text-black dark:text-textColor">
                                             <div class="flex items-center gap-2.5">
                                                 <i class="fa-solid fa-wand-magic-sparkles text-gray-500 w-4 text-center"></i>
@@ -647,7 +662,7 @@
                                         <i class="fa-solid fa-chevron-right text-[10px] text-gray-400"></i>
                                     </button>
                                 </div>
-                                <div class="py-1 border-b border-black/5 dark:border-white/5">
+                                <div v-if="currentPlatform === 'chatgpt'" class="py-1 border-b border-black/5 dark:border-white/5">
                                     <button @click="toggleFeature('createImage')" class="w-full flex items-center justify-between px-3.5 py-2 hover:bg-black/5 dark:hover:bg-white/5 transition text-left text-black dark:text-textColor">
                                         <div class="flex items-center gap-2.5">
                                             <i class="fa-solid fa-wand-magic-sparkles text-gray-500 w-4 text-center"></i>
@@ -807,6 +822,19 @@
             const browserStatus = ref({ status: 'disconnected', url: 'N/A', title: 'N/A', queue: {} });
             const isDarkMode = ref(false); // Default to Light Mode matching Screenshot
 
+            // ---- AI platform (ChatGPT / Gemini) ----
+            const enabledPlatforms = ref(['chatgpt']);
+            const platformLabels = ref({ chatgpt: 'ChatGPT' });
+            const currentPlatform = ref('chatgpt');
+            // Persisted conversation history keyed by platform, so ChatGPT and
+            // Gemini threads are kept fully isolated in the UI as well.
+            const SESSIONS_STORAGE_KEY = 'share_gate_sessions_v2';
+            const LEGACY_STORAGE_KEY = 'chatgpt_share_sessions';
+            const sessionsStore = ref({
+                chatgpt: { sessions: [], activeId: null },
+                gemini: { sessions: [], activeId: null }
+            });
+
             // ---- Authentication state ----
             const currentUser = ref(null);
             const authMode = ref('login');
@@ -815,6 +843,7 @@
             const authLoading = ref(false);
             const allowRegistration = ref(false);
             let statusTimer = null;
+            let sessionsInitialized = false;
 
             // Sidebar, Header Models & Toasts States
             const isSidebarOpen = ref(true);
@@ -896,27 +925,82 @@
                 });
             };
 
-            // LocalStorage persistence helpers
+            // LocalStorage persistence helpers — history is stored per platform.
+            const commitCurrentView = () => {
+                sessionsStore.value[currentPlatform.value] = {
+                    sessions: sessions.value,
+                    activeId: activeSessionId.value
+                };
+            };
+
             const saveSessionsToLocal = () => {
-                localStorage.setItem('chatgpt_share_sessions', JSON.stringify(sessions.value));
+                commitCurrentView();
+                try {
+                    localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(sessionsStore.value));
+                } catch (e) { /* storage full / unavailable */ }
+            };
+
+            const renderCurrentPlatformView = (createIfEmpty) => {
+                const entry = sessionsStore.value[currentPlatform.value] || { sessions: [], activeId: null };
+                sessions.value = Array.isArray(entry.sessions) ? entry.sessions : [];
+                if (!sessions.value.length) {
+                    if (createIfEmpty) {
+                        createNewSession();
+                        return;
+                    }
+                    activeSessionId.value = null;
+                } else {
+                    const valid = entry.activeId && sessions.value.some(s => s.id === entry.activeId);
+                    activeSessionId.value = valid ? entry.activeId : sessions.value[0].id;
+                }
+            };
+
+            const switchPlatform = (platform) => {
+                if (platform === currentPlatform.value || !enabledPlatforms.value.includes(platform)) return;
+                if (loading.value) {
+                    showToast('请等待当前请求完成后再切换平台', 'info');
+                    return;
+                }
+                // ChatGPT-only toggles do not apply to other platforms; clear them.
+                if (platform !== 'chatgpt') {
+                    features.value.thinking = false;
+                    features.value.webSearch = false;
+                    features.value.deepResearch = false;
+                    features.value.createImage = false;
+                }
+                saveSessionsToLocal();
+                currentPlatform.value = platform;
+                renderCurrentPlatformView(true);
+                saveSessionsToLocal();
+                nextTick(scrollToBottom);
             };
 
             const loadSessionsFromLocal = () => {
-                const stored = localStorage.getItem('chatgpt_share_sessions');
+                const stored = localStorage.getItem(SESSIONS_STORAGE_KEY);
                 if (stored) {
                     try {
-                        sessions.value = JSON.parse(stored);
-                    } catch (e) {
-                        sessions.value = [];
+                        const parsed = JSON.parse(stored);
+                        if (parsed && typeof parsed === 'object') {
+                            Object.keys(sessionsStore.value).forEach(k => {
+                                if (parsed[k] && Array.isArray(parsed[k].sessions)) {
+                                    sessionsStore.value[k] = parsed[k];
+                                }
+                            });
+                        }
+                    } catch (e) { /* keep defaults */ }
+                } else {
+                    // Migrate legacy single-platform history into the ChatGPT group.
+                    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+                    if (legacy) {
+                        try {
+                            const old = JSON.parse(legacy);
+                            if (Array.isArray(old)) {
+                                sessionsStore.value.chatgpt.sessions = old;
+                            }
+                        } catch (e) { /* ignore */ }
                     }
                 }
-                
-                // If sessions list is empty, initialize a default one
-                if (!sessions.value.length) {
-                    createNewSession();
-                } else {
-                    activeSessionId.value = sessions.value[0].id;
-                }
+                renderCurrentPlatformView(true);
             };
 
             // Session CRUD
@@ -1191,6 +1275,22 @@
                 try {
                     const data = await apiFetch('/api/status');
                     browserStatus.value = data;
+                    // Learn which platforms the server has enabled.
+                    if (Array.isArray(data.enabled_platforms) && data.enabled_platforms.length) {
+                        enabledPlatforms.value = data.enabled_platforms;
+                        platformLabels.value = data.platform_labels || platformLabels.value;
+                        const want = data.default_platform;
+                        if (!sessionsInitialized) {
+                            sessionsInitialized = true;
+                            currentPlatform.value = enabledPlatforms.value.includes(want)
+                                ? want : enabledPlatforms.value[0];
+                            loadSessionsFromLocal();
+                        } else if (!enabledPlatforms.value.includes(currentPlatform.value)) {
+                            currentPlatform.value = enabledPlatforms.value[0];
+                            renderCurrentPlatformView(true);
+                            saveSessionsToLocal();
+                        }
+                    }
                 } catch (e) {
                     // 401 is handled by apiFetch; only log other errors.
                     if (e.status !== 401) console.error('Failed to get status:', e);
@@ -1204,13 +1304,18 @@
             };
 
             const resetSession = async () => {
-                if (!confirm('确定清理全局浏览器会话？这会重置 ChatGPT 页面的会话，并清空所有用户的上下文！')) return;
+                const label = platformLabels.value[currentPlatform.value] || currentPlatform.value;
+                if (!confirm(`确定清理全局浏览器会话？这会重置 ${label} 页面的会话，并清空所有用户在该平台的上下文！`)) return;
                 try {
-                    const data = await apiFetch('/api/new_chat', { method: 'POST' });
+                    const data = await apiFetch('/api/new_chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ platform: currentPlatform.value })
+                    });
                     if (data.status === 'success') {
                         activeSession.value.messages = [];
                         saveSessionsToLocal();
-                        alert('会话已成功重置！');
+                        alert(`${label} 会话已成功重置！`);
                         fetchStatus();
                     } else {
                         alert('重置失败: ' + data.message);
@@ -1253,6 +1358,7 @@
                             'Content-Type': 'application/json'
                         },
                         body: JSON.stringify({
+                            platform: currentPlatform.value,
                             prompt: text,
                             files: files.map(f => ({ name: f.name, data: f.data })),
                             features: {
@@ -1382,7 +1488,8 @@
                 window.addEventListener('click', handleClickAway);
                 window.addEventListener('keydown', handleKeyboardShortcuts);
                 if (loggedIn) {
-                    loadSessionsFromLocal();
+                    // First fetchStatus() learns the enabled platforms and loads
+                    // per-platform conversation history, then polling continues.
                     startStatusPolling();
                 }
             });
@@ -1397,6 +1504,11 @@
                 sessions,
                 activeSessionId,
                 activeSession,
+                // AI platforms
+                enabledPlatforms,
+                platformLabels,
+                currentPlatform,
+                switchPlatform,
                 activePlusMenu,
                 activeSubMenu,
                 features,

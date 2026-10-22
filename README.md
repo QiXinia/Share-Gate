@@ -18,8 +18,8 @@
 
 <br/>
 
-一个通过 Playwright 自动化接管本地已登录 ChatGPT 网页端的浏览器，<br/>
-旨在**与好友或家人安全共享同一个 ChatGPT 账号（如 Plus 账号），并实现对话内容完全隔离**的私密共享系统。
+一个通过 Playwright 自动化接管本地已登录 **ChatGPT / Google Gemini** 网页端的浏览器，<br/>
+旨在**与好友或家人安全共享同一个 AI 账号（如 ChatGPT Plus / Gemini），并实现对话内容完全隔离**的私密共享系统，内置多用户登录鉴权与安全加固。
 
 </div>
 
@@ -151,6 +151,37 @@ venv\Scripts\python.exe auth.py deluser alice               # 删除账户
 
 ---
 
+## 🤖 ChatGPT / Google Gemini 多平台与对话隔离
+
+系统可在同一个已接管的浏览器中同时驱动 **ChatGPT** 与 **Google Gemini**，二者共享同一套登录、排队与安全机制。
+
+**1. 启用平台**
+
+在 `.env` 中配置（默认仅 ChatGPT）：
+
+```bash
+AI_PLATFORMS=chatgpt,gemini
+DEFAULT_PLATFORM=chatgpt
+```
+
+- 启动器会自动打开 `chatgpt.com` 与 `gemini.google.com` 两个标签页（它们共用同一个浏览器配置目录，登录态都会被保存）。
+- 网页端侧边栏顶部会出现 **ChatGPT / Google Gemini** 切换按钮；Telegram 中可用 `/platform` 查看/切换、`/new gemini` 切换并开新会话。
+
+**2. Gemini 登录**
+
+- Gemini 使用 **Google 账号**登录：首次启动后在自动打开的 `gemini.google.com` 标签页中手动登录一次即可，之后由配置目录保持登录。
+- 若未登录就发送消息，系统会返回明确提示“请在浏览器中登录 Google 账号”，不会卡死；`/status` 也会显示各平台的登录状态。
+
+**3. 对话隔离**
+
+- 每次点击「新建对话」或调用 `/new <平台>` 都会在对应平台开启一个**全新的会话线程**（ChatGPT 重新打开首页，Gemini 点击“新建对话”），清空上一轮上下文，避免不同用户互相串话。
+- 网页端的本地历史记录也按平台分别保存，ChatGPT 与 Gemini 的对话互不混合。
+- 所有平台仍共用一个浏览器、串行 FIFO 排队，因此高并发下会自动排队，不会出现两个请求同时操作同一标签页。
+
+> 📌 **关于 Gemini 页面选择器**：Gemini 网页的 DOM 由 Google 频繁更新且随语言变化，驱动层（`gemini_adapter.py`）已将所有选择器集中为一组多重容错列表（输入框、发送/停止按钮、新建对话、回复容器）。若日后 Google 改版导致某个步骤失效，只需在该文件顶部的 `SELECTORS` 中补充新的选择器即可。
+
+---
+
 ## 🌐 公网（ngrok / 局域网）暴露安全清单
 
 将网页通过 ngrok 或局域网开放给朋友时，请务必：
@@ -172,7 +203,8 @@ venv\Scripts\python.exe auth.py deluser alice               # 删除账户
 - **`auth.py`**：用户认证模块（PBKDF2 密码哈希、服务端会话、登录限流、账号管理 CLI）。
 - **`bot.py`**：Telegram 机器人逻辑，含串行 FIFO 排队、白名单/管理员控制、指令响应和多模态交互。
 - **`app_streamlit.py`**：Streamlit 本地管理员控制台（可选，已加访问密码门）。
-- **`chatgpt_browser.py`**：基于 Playwright 的底层浏览器操纵驱动，含图片下载、跨进程文件锁、跨平台队列计数与健康指标。
+- **`chatgpt_browser.py`**：基于 Playwright 的多平台浏览器控制器（ChatGPT / Gemini），含 CDP 连接、标签页管理、图片下载、跨进程文件锁、队列计数与健康指标。
+- **`gemini_adapter.py`**：Google Gemini 网页驱动，负责登录检测、新建对话隔离、内容输入、发送、等待完成与回复提取（选择器集中容错）。
 - **`config.py`**：全局配置加载（含 Web、安全、白名单、上传限制、跨平台路径等）。
 - **`static/index.html`**：网页端控制台（Vue 3），含登录/注册页、用户菜单与会话管理。
 - **`static/vendor/`**：本地托管的前端库（Vue / Tailwind / Marked），无需外网 CDN 即可加载。

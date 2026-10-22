@@ -92,6 +92,22 @@ browser = ChatGPTBrowser(cdp_url=config.CDP_URL, temp_dir=config.TEMP_DIR)
 queue_counter = 0
 queue_lock = asyncio.Lock()
 
+# Currently selected AI platform for plain chat messages (shared, FIFO model).
+current_platform = config.DEFAULT_PLATFORM
+
+# Friendly aliases accepted by /new and /platform.
+PLATFORM_ALIASES = {
+    "chatgpt": "chatgpt", "gpt": "chatgpt", "c": "chatgpt", "openai": "chatgpt",
+    "gemini": "gemini", "google": "gemini", "g": "gemini", "谷歌": "gemini",
+}
+
+
+def resolve_platform_arg(raw):
+    """Map a user-supplied platform token to an enabled platform, or None."""
+    key = (raw or "").strip().lower()
+    platform = PLATFORM_ALIASES.get(key, key)
+    return platform if platform in config.AI_PLATFORMS else None
+
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends a greeting message when /start is run."""
@@ -135,9 +151,12 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
             status_msg = await update.message.reply_text("🤖 **正在为您准备会话，连接浏览器...**")
 
         # Update status once execution begins
+        platform_label = config.PLATFORMS.get(current_platform, {}).get("label", "AI")
         if status_msg:
             try:
-                await status_msg.edit_text("🚀 **正在向 ChatGPT 提交请求，请稍候（可能需要 1-3 分钟）...**")
+                await status_msg.edit_text(
+                    f"🚀 **正在向 {platform_label} 提交请求，请稍候（可能需要 1-3 分钟）...**"
+                )
             except Exception:
                 pass
         
@@ -161,10 +180,13 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
 
         reporter_task = asyncio.create_task(progress_reporter())
 
-        logger.info(f"Processing request: prompt='{prompt[:50]}', image={image_path}, files={file_paths}")
+        logger.info(f"Processing request on [{current_platform}]: prompt='{prompt[:50]}', image={image_path}, files={file_paths}")
         try:
             # Lock is now managed inside browser.send_message() itself
-            result = await browser.send_message(prompt, image_path=image_path, file_paths=file_paths)
+            result = await browser.send_message(
+                prompt, image_path=image_path, file_paths=file_paths,
+                platform=current_platform,
+            )
         finally:
             # Always ensure reporter task is stopped cleanly
             stop_progress = True
@@ -289,12 +311,30 @@ async def on_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @restricted
 async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to start a fresh ChatGPT conversation session.
-    
+    """Command to start a fresh conversation on the chosen platform.
+
+    Usage: /new            new chat on the current platform
+           /new gemini     switch to Gemini and start a new chat
+           /new chatgpt    switch to ChatGPT and start a new chat
+
     Refuses to execute if other tasks are currently queued/running,
     to prevent destroying another user's ongoing conversation context.
     """
-    global queue_counter
+    global queue_counter, current_platform
+
+    # Optional platform argument: /new gemini
+    target = current_platform
+    if context.args:
+        parsed = resolve_platform_arg(context.args[0])
+        if parsed is None:
+            await update.message.reply_text(
+                f"⚠️ 未知平台：{context.args[0]}\n"
+                f"当前启用：{', '.join(config.AI_PLATFORMS)}\n"
+                "用法：`/new gemini` 或 `/new chatgpt`",
+                parse_mode="Markdown"
+            )
+            return
+        target = parsed
 
     # Safety check: refuse if other tasks are active
     async with queue_lock:
@@ -308,17 +348,19 @@ async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         queue_counter += 1
     
+    target_label = config.PLATFORMS.get(target, {}).get("label", target)
     status_msg = await update.message.reply_text("🔄 **正在请求开启新会话...**")
     try:
-        await status_msg.edit_text("🚀 **正在清理浏览器上下文，开启新会话...**")
+        await status_msg.edit_text(f"🚀 **正在清理 {target_label} 上下文，开启新会话...**")
         # Lock is now managed inside browser.new_chat() itself
-        result = await browser.new_chat()
+        result = await browser.new_chat(platform=target)
         await status_msg.delete()
         if result["status"] == "success":
+            current_platform = target
             await update.message.reply_text(
-                "✅ **成功开启新会话！**\n"
-                "之前的上下文已被清除。\n\n"
-                "⚠️ *注意：所有用户（包括 Streamlit 前端）的对话上下文均已重置。*",
+                f"✅ **已在 {target_label} 开启新会话！**\n"
+                "之前的上下文已被清除，后续消息将发送到该平台。\n\n"
+                "⚠️ *注意：所有用户共享同一浏览器会话，切换平台会影响全局。*",
                 parse_mode="Markdown"
             )
         else:
@@ -330,15 +372,52 @@ async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             queue_counter = max(0, queue_counter - 1)
 
 @restricted
+async def switch_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the current platform or switch it: /platform gemini."""
+    global current_platform
+    if not context.args:
+        enabled = "\n".join(
+            f"{'👉' if p == current_platform else '  '} "
+            f"{config.PLATFORMS[p]['label']}  (`{p}`)"
+            for p in config.AI_PLATFORMS
+        )
+        await update.message.reply_text(
+            f"ℹ️ **当前平台**：{config.PLATFORMS[current_platform]['label']}\n\n"
+            f"{enabled}\n\n"
+            "切换：`/platform gemini`（切换后建议用 `/new gemini` 开启新会话）",
+            parse_mode="Markdown"
+        )
+        return
+    parsed = resolve_platform_arg(context.args[0])
+    if parsed is None:
+        await update.message.reply_text(
+            f"⚠️ 未知平台：{context.args[0]}\n当前启用：{', '.join(config.AI_PLATFORMS)}"
+        )
+        return
+    current_platform = parsed
+    await update.message.reply_text(
+        f"✅ 已切换到 **{config.PLATFORMS[parsed]['label']}**。\n"
+        f"发送 `/new {parsed}` 可开启该平台的全新隔离会话。",
+        parse_mode="Markdown"
+    )
+
+
+@restricted
 async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to retrieve current browser connection and queue status."""
     browser_info = await browser.get_status()
+    # Per-platform one-line status.
+    lines = []
+    for p in browser_info.get("enabled_platforms", config.AI_PLATFORMS):
+        st = browser_info.get("platforms", {}).get(p, {})
+        login_flag = "✅已登录" if st.get("logged_in") else ("⚠️未登录" if st.get("status") == "connected" else "—")
+        lines.append(f"  • {config.PLATFORMS[p]['label']}: {st.get('status')} {login_flag}")
+    platform_block = "\n".join(lines)
     status_text = (
         f"ℹ️ **当前状态信息**\n\n"
         f"🤖 **Bot 状态**: 运行中\n"
-        f"🌐 **浏览器连接**: `{browser_info.get('status')}`\n"
-        f"📄 **当前标签页**: `{browser_info.get('title')}`\n"
-        f"🔗 **当前 URL**: `{browser_info.get('url')}`\n"
+        f"🎛️ **当前平台**: {config.PLATFORMS.get(current_platform, {}).get('label', current_platform)}\n"
+        f"{platform_block}\n"
         f"👥 **队列排队人数**: `{queue_counter}`"
     )
     await update.message.reply_text(status_text)
@@ -369,11 +448,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "ℹ️ **可用指令列表：**\n\n"
         "• `/start` - 查看机器人引导介绍\n"
-        "• `/new` - 开启新对话（清除当前 ChatGPT 对话上下文）\n"
-        "• `/status` - 查看浏览器连接状态与当前队列排队人数\n"
-        "• `/log` - 获取后台最近 25 行运行日志\n"
+        "• `/platform` - 查看 / 切换 AI 平台（chatgpt / gemini）\n"
+        "• `/new` - 开启新对话，如 `/new gemini`（切换平台并清除上下文）\n"
+        "• `/status` - 查看各平台连接/登录状态与队列排队人数\n"
+        "• `/log` - 获取后台最近 25 行运行日志（管理员）\n"
         "• `/help` - 显示此帮助信息\n\n"
-        "💡 *提示：您可以直接向我发送任何文字进行聊天，或发送图片附带文字进行图生图交互。*"
+        "💡 *提示：首次使用 Gemini 请在浏览器中用 Google 账号登录 gemini.google.com；"
+        "之后可直接发送文字，或发送图片/文件进行交互。*"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -409,6 +490,7 @@ def main():
     # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new_chat))
+    app.add_handler(CommandHandler("platform", switch_platform))
     app.add_handler(CommandHandler("status", bot_status))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("help", help_command))

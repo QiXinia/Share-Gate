@@ -46,6 +46,52 @@ except Exception:
     CDP_HOST = "127.0.0.1"
 
 # ---------------------------------------------------------------------------
+# AI platforms (ChatGPT / Google Gemini)
+# ---------------------------------------------------------------------------
+# Static metadata for every supported provider. The host fragments are used to
+# match already-open tabs in the connected browser.
+PLATFORMS = {
+    "chatgpt": {
+        "label": "ChatGPT",
+        "home_url": "https://chatgpt.com",
+        "new_chat_url": "https://chatgpt.com",
+        "host_fragments": ["chatgpt.com"],
+        "login_url_fragments": ["auth.openai.com", "/auth/login"],
+    },
+    "gemini": {
+        "label": "Google Gemini",
+        "home_url": "https://gemini.google.com/app",
+        "new_chat_url": "https://gemini.google.com/app",
+        "host_fragments": ["gemini.google.com"],
+        "login_url_fragments": ["accounts.google.com", "accounts.youtube.com"],
+    },
+}
+
+
+def _parse_platforms(raw):
+    """Parse a comma-separated platform list, always keeping a sane default."""
+    requested = [chunk.strip().lower() for chunk in (raw or "").replace(";", ",").split(",")]
+    requested = [p for p in requested if p in PLATFORMS]
+    if not requested:
+        requested = ["chatgpt"]
+    # De-duplicate while preserving order.
+    seen = set()
+    result = []
+    for p in requested:
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
+
+
+# Comma-separated list of enabled providers, e.g. "chatgpt" or "chatgpt,gemini".
+AI_PLATFORMS = _parse_platforms(os.getenv("AI_PLATFORMS", "chatgpt"))
+# The platform used by clients that do not pass an explicit platform argument.
+DEFAULT_PLATFORM = os.getenv("DEFAULT_PLATFORM", "chatgpt").strip().lower()
+if DEFAULT_PLATFORM not in AI_PLATFORMS:
+    DEFAULT_PLATFORM = AI_PLATFORMS[0]
+
+# ---------------------------------------------------------------------------
 # Proxy settings for requests/bot and playwright
 # ---------------------------------------------------------------------------
 HTTP_PROXY = os.getenv("HTTP_PROXY")

@@ -263,12 +263,14 @@ def launch_browser(debug_port):
     profile_dir = config.BROWSER_PROFILE_DIR
     os.makedirs(profile_dir, exist_ok=True)
 
+    # Open one tab per enabled platform (ChatGPT / Gemini).
+    platform_urls = [config.PLATFORMS[p]["home_url"] for p in config.AI_PLATFORMS]
     browser_cmd = [
         browser_bin,
         f"--user-data-dir={profile_dir}",
         f"--remote-debugging-port={debug_port}",
         f"--remote-debugging-address={config.CDP_HOST}",
-        "https://chatgpt.com",
+        *platform_urls,
     ]
     try:
         subprocess.Popen(

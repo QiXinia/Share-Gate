@@ -586,8 +586,23 @@ class ChatGPTWebHandler(BaseHTTPRequestHandler):
             logger.error("Error fetching status: %s", e)
             self.send_json_response({"status": "error", "message": str(e)}, status_code=500)
 
+    def _resolve_platform(self, body):
+        """Validate and normalise the requested platform from a JSON body."""
+        platform = body.get("platform") if isinstance(body, dict) else None
+        platform = (platform or config.DEFAULT_PLATFORM).strip().lower()
+        if platform not in config.AI_PLATFORMS:
+            self.send_json_error(400, f"平台 {platform} 未启用或不受支持")
+            return None
+        return platform
+
     def handle_new_chat(self, user):
-        future = asyncio.run_coroutine_threadsafe(browser.new_chat(), loop)
+        body = self._read_json_body()
+        if body is None:
+            return
+        platform = self._resolve_platform(body)
+        if platform is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(browser.new_chat(platform=platform), loop)
         try:
             result = future.result(timeout=30)
             self.send_json_response(result)
@@ -609,6 +624,9 @@ class ChatGPTWebHandler(BaseHTTPRequestHandler):
         features = body.get('features', {}) or {}
         if not isinstance(files, list) or not isinstance(features, dict):
             self.send_json_error(400, "请求参数格式错误")
+            return
+        platform = self._resolve_platform(body)
+        if platform is None:
             return
         if not prompt and not files:
             self.send_json_error(400, "消息内容不能为空")
@@ -659,11 +677,16 @@ class ChatGPTWebHandler(BaseHTTPRequestHandler):
                 logger.info("Saved upload from %s: %s (%d bytes)",
                             user["username"], temp_path, len(file_bytes))
 
-            logger.info("Chat request by %s: prompt=%r files=%d",
-                        user["username"], prompt[:60], len(temp_files))
+            logger.info("Chat request by %s on [%s]: prompt=%r files=%d",
+                        user["username"], platform, prompt[:60], len(temp_files))
 
+            # Feature toggles are ChatGPT-specific; ignore them on Gemini.
             future = asyncio.run_coroutine_threadsafe(
-                browser.send_message(prompt, file_paths=temp_files, features=features),
+                browser.send_message(
+                    prompt, file_paths=temp_files,
+                    features=features if platform == "chatgpt" else None,
+                    platform=platform,
+                ),
                 loop
             )
             result = future.result(timeout=360)  # 6 minutes max

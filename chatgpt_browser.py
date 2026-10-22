@@ -7,6 +7,9 @@ import logging
 from contextlib import contextmanager
 from playwright.async_api import async_playwright
 
+import config
+from gemini_adapter import GeminiAdapter, GeminiLoginRequired
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -73,11 +76,17 @@ class ChatGPTBrowser:
         self.playwright = None
         self.browser = None
         self.context = None
+        # One tab per enabled platform: {"chatgpt": page, "gemini": page}
+        self.pages = {}
+        # `self.page` always points at the active/default platform's tab so the
+        # ChatGPT-specific code paths keep working unchanged.
         self.page = None
         self.lock = asyncio.Lock()
         # Cross-process file lock — prevents bot.py and Streamlit from
         # controlling the browser at the same time.
         self._file_lock = _FileLock(os.path.join(self.temp_dir, ".browser.lock"))
+        # Google Gemini provider adapter (drives the Gemini tab).
+        self._gemini = GeminiAdapter(temp_dir=self.temp_dir)
         # Queue / health metrics (mutated only from the asyncio loop thread).
         self.pending_count = 0   # tasks accepted, including the one running
         self.active_count = 0    # tasks currently driving the browser
@@ -113,23 +122,59 @@ class ChatGPTBrowser:
             ) from e
 
         self.context = self.browser.contexts[0]
-        
-        # Look for an existing ChatGPT tab
-        self.page = None
-        for p in self.context.pages:
-            if "chatgpt.com" in p.url:
-                self.page = p
-                logger.info(f"Found active ChatGPT tab: '{await p.title()}' (URL: {p.url})")
-                break
 
-        # If not found, open a new page on chatgpt.com
-        if not self.page:
-            logger.info("No active ChatGPT tab found. Opening a new tab on chatgpt.com...")
-            self.page = await self.context.new_page()
-            await self.page.goto("https://chatgpt.com")
-            # Wait for page to load
-            await self.page.wait_for_load_state("networkidle")
-            logger.info("Opened chatgpt.com in a new tab.")
+        # Discover or open one tab per enabled platform (ChatGPT / Gemini).
+        self.pages = {}
+        for platform in config.AI_PLATFORMS:
+            try:
+                self.pages[platform] = await self._find_or_open_page(platform)
+            except Exception as e:
+                logger.error("Failed to prepare browser tab for platform %s: %s", platform, e)
+
+        # Keep the default platform's tab as the active `self.page`.
+        self.page = self.pages.get(config.DEFAULT_PLATFORM)
+        if self.page is None and self.pages:
+            self.page = next(iter(self.pages.values()))
+
+    async def _find_or_open_page(self, platform):
+        """Find an existing tab for the platform, otherwise open a new one."""
+        meta = config.PLATFORMS.get(platform)
+        if not meta:
+            raise ValueError(f"Unknown platform: {platform}")
+        fragments = meta["host_fragments"]
+
+        for p in self.context.pages:
+            try:
+                url = p.url or ""
+            except Exception:
+                continue
+            if any(frag in url for frag in fragments):
+                logger.info("Found active %s tab: '%s' (URL: %s)",
+                            platform, await p.title(), url)
+                return p
+
+        logger.info("No active %s tab found. Opening a new tab on %s ...",
+                    platform, meta["home_url"])
+        page = await self.context.new_page()
+        try:
+            await page.goto(meta["home_url"], wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            # Slow assets must not abort the connection; the adapter retries later.
+            logger.warning("Initial navigation to %s returned: %s", meta["home_url"], e)
+        logger.info("Opened %s in a new tab.", meta["home_url"])
+        return page
+
+    async def _ensure_page(self, platform):
+        """Return a live tab for the platform, (re)opening it if needed."""
+        if self.context is None or self.browser is None:
+            await self.start()
+        page = self.pages.get(platform)
+        if page is None or page.is_closed():
+            page = await self._find_or_open_page(platform)
+            self.pages[platform] = page
+        if platform == config.DEFAULT_PLATFORM:
+            self.page = page
+        return page
 
     async def stop(self):
         """Disconnect from the browser and stop playwright."""
@@ -138,6 +183,7 @@ class ChatGPTBrowser:
         if self.playwright:
             await self.playwright.stop()
         self.page = None
+        self.pages = {}
         self.context = None
         self.browser = None
         self.playwright = None
@@ -199,30 +245,49 @@ class ChatGPTBrowser:
             logger.error(f"Error downloading image: {e}")
             return False
 
-    async def send_message(self, prompt, image_path=None, file_paths=None, features=None, timeout_minutes=6):
-        """Sends a message to ChatGPT, handles image/file uploads if present, and returns the response.
+    async def send_message(self, prompt, image_path=None, file_paths=None, features=None,
+                           timeout_minutes=6, platform=None):
+        """Sends a message to the selected platform (default: ChatGPT), handling
+        image/file uploads and returning the response.
 
         Uses both an asyncio.Lock (intra-process) and a file lock (cross-process)
         to ensure only one caller drives the browser at any given time.
         """
+        platform = platform or config.DEFAULT_PLATFORM
+        if platform not in config.PLATFORMS:
+            return {"status": "error", "message": f"不支持的平台: {platform}"}
         self.pending_count += 1
         self.last_activity_at = time.time()
         try:
             async with self.lock:
-                return await self._send_message_inner(prompt, image_path, file_paths, features, timeout_minutes)
+                return await self._send_message_inner(
+                    prompt, image_path, file_paths, features, timeout_minutes, platform
+                )
         finally:
             self.pending_count = max(0, self.pending_count - 1)
             self.total_completed += 1
             self.last_activity_at = time.time()
 
-    async def _send_message_inner(self, prompt, image_path=None, file_paths=None, features=None, timeout_minutes=6):
+    async def _send_message_inner(self, prompt, image_path=None, file_paths=None,
+                                  features=None, timeout_minutes=6, platform=None):
         """Inner implementation of send_message, called while holding the asyncio lock."""
+        platform = platform or config.DEFAULT_PLATFORM
         self.active_count += 1
         # Acquire cross-process file lock in a thread so we don't block the event loop
         loop = asyncio.get_running_loop()
         lock_ctx = self._file_lock.acquire()
         await loop.run_in_executor(None, lock_ctx.__enter__)
         try:
+            page = await self._ensure_page(platform)
+            if platform == "gemini":
+                try:
+                    return await self._gemini.send_message(
+                        page, prompt, file_paths=file_paths, timeout_minutes=timeout_minutes
+                    )
+                except GeminiLoginRequired as e:
+                    return {"status": "error", "message": str(e)}
+            # ChatGPT path: point self.page at the ChatGPT tab and reuse logic.
+            self.page = page
             return await self._do_send_message(prompt, image_path, file_paths, features, timeout_minutes)
         finally:
             try:
@@ -579,12 +644,15 @@ class ChatGPTBrowser:
             logger.error(f"Error during message submission: {e}")
             return {"status": "error", "message": f"Browser interaction error: {e}"}
 
-    async def new_chat(self):
-        """Navigates to chatgpt.com to start a new conversation thread.
+    async def new_chat(self, platform=None):
+        """Starts a new, isolated conversation thread on the selected platform.
 
         Acquires both the asyncio lock and the cross-process file lock
         to prevent conflicts with any concurrent send_message calls.
         """
+        platform = platform or config.DEFAULT_PLATFORM
+        if platform not in config.PLATFORMS:
+            return {"status": "error", "message": f"不支持的平台: {platform}"}
         self.pending_count += 1
         self.active_count += 1
         self.last_activity_at = time.time()
@@ -594,6 +662,10 @@ class ChatGPTBrowser:
                 lock_ctx = self._file_lock.acquire()
                 await loop.run_in_executor(None, lock_ctx.__enter__)
                 try:
+                    page = await self._ensure_page(platform)
+                    if platform == "gemini":
+                        return await self._gemini.new_chat(page)
+                    self.page = page
                     return await self._do_new_chat()
                 finally:
                     await loop.run_in_executor(None, lock_ctx.__exit__, None, None, None)
@@ -604,7 +676,7 @@ class ChatGPTBrowser:
             self.last_activity_at = time.time()
 
     async def _do_new_chat(self):
-        """Inner new_chat implementation, called while holding both locks."""
+        """Inner new_chat implementation for ChatGPT, called under both locks."""
         try:
             if not self.page or self.page.is_closed():
                 await self.start()
@@ -616,8 +688,27 @@ class ChatGPTBrowser:
             logger.error(f"Error starting new chat: {e}")
             return {"status": "error", "message": f"创建新会话失败: {e}"}
 
+    async def _platform_status(self, platform):
+        """Return connection/tab/login status for a single platform."""
+        meta = config.PLATFORMS[platform]
+        page = self.pages.get(platform)
+        if page is None or page.is_closed():
+            return {"status": "disconnected", "url": "N/A", "title": "N/A", "logged_in": False}
+        try:
+            url = page.url or ""
+            title = await page.title()
+            at_login = any(frag in url for frag in meta["login_url_fragments"])
+            return {
+                "status": "connected",
+                "url": url,
+                "title": title,
+                "logged_in": not at_login,
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e), "logged_in": False}
+
     async def get_status(self):
-        """Returns browser connection status, active tab and queue metrics."""
+        """Returns browser connection status, per-platform tabs and queue metrics."""
         queue_info = {
             "pending": self.pending_count,
             "active": self.active_count,
@@ -625,14 +716,24 @@ class ChatGPTBrowser:
             "total_completed": self.total_completed,
             "last_activity_at": self.last_activity_at,
         }
-        if not self.page or self.page.is_closed():
-            return {"status": "disconnected", "url": "N/A", "title": "N/A", "queue": queue_info}
-        try:
-            title = await self.page.title()
-            url = self.page.url
-            return {"status": "connected", "url": url, "title": title, "queue": queue_info}
-        except Exception as e:
-            return {"status": "error", "message": str(e), "queue": queue_info}
+
+        # Per-platform status (ChatGPT / Gemini).
+        platforms_status = {}
+        for platform in config.AI_PLATFORMS:
+            platforms_status[platform] = await self._platform_status(platform)
+
+        # Backwards-compatible top-level fields reflect the default platform.
+        default = platforms_status.get(config.DEFAULT_PLATFORM, {})
+        return {
+            "status": default.get("status", "disconnected"),
+            "url": default.get("url", "N/A"),
+            "title": default.get("title", "N/A"),
+            "queue": queue_info,
+            "default_platform": config.DEFAULT_PLATFORM,
+            "enabled_platforms": list(config.AI_PLATFORMS),
+            "platform_labels": {p: config.PLATFORMS[p]["label"] for p in config.AI_PLATFORMS},
+            "platforms": platforms_status,
+        }
 
 
 
