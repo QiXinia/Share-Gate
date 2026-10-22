@@ -7,8 +7,16 @@ __pycache__/
 # 密钥与个人配置文件 (严禁上传)
 .env
 
-# 运行产生的日志与临时目录
+# 用户账户、会话、服务器密钥 (新增)
+/data/
+secret.key
+
+# 运行产生的日志
+*.log
 /bot.log
+/web_server.log
+
+# 临时目录、浏览器配置与运行产物
 /temp/
 /chrome-dev-profile/
 *.diff

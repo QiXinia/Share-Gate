@@ -62,9 +62,25 @@
    - 🌐 **浏览器自动兜底**：系统会自动在常见目录寻找 Google Chrome；如果未安装 Chrome，将**自动降级使用 Windows 自带的 Microsoft Edge** 浏览器，同样完美适配。
    - 🔑 **Telegram Bot Token 容错**：如果未配置 Token，系统会自动进入“纯 Web 模式”运行，跳过 Bot 启动，不会引发崩溃。
    - 🔗 **Ngrok 智能识别**：若配置了内网穿透且系统装有 ngrok，会自动在后台静默拉起并分配公网域名，检测不到则会自动降级为仅本地运行。
-5. **统一生命周期管理 (One-Click Start/Stop)**：
+6. **统一生命周期管理 (One-Click Start/Stop)**：
    - 双击 `start_all.bat` 一键完成所有运行环境（Python、Venv、依赖）的自检、浏览器接管、穿透绑定及服务拉起。
-   - 按下 `Ctrl+C` 退出时，编排器会**安全且彻底地关闭所有后台子进程（包括 ngrok、bot 和 streamlit）**，彻底避免端口占用与僵尸进程。
+   - 按下 `Ctrl+C` 退出时，编排器会**安全且彻底地关闭所有后台子进程（包括 ngrok、bot 和 web）**：Windows 上使用 `taskkill /T /F` 终止整个进程树，Linux/macOS 使用进程组 kill，彻底避免端口占用与僵尸进程。
+
+7. **多用户登录与账号体系** 🔐：
+   - 网页端内置**用户名/密码登录**，会话基于服务端可撤销的随机 Token（HttpOnly + SameSite Cookie），未登录无法访问任何对话接口。
+   - 密码使用 **PBKDF2-HMAC-SHA256（20 万次迭代 + 随机盐）** 加盐哈希存储，服务端不保存明文。
+   - 支持管理员/普通用户角色、自助注册开关、登录失败锁定、命令行建号改密。
+   - Telegram 机器人支持**用户 ID 白名单**与管理员指令控制。
+
+8. **安全加固** 🛡️：
+   - 默认仅监听 `127.0.0.1`；对外暴露（ngrok/局域网）时强制登录。
+   - 修复了静态文件的**路径穿越漏洞**，并加入安全响应头（CSP、X-Frame-Options、X-Content-Type-Options、Referrer-Policy、Permissions-Policy）。
+   - 限制上传文件大小/数量、拦截可执行脚本类型、请求体大小上限与请求线程背压，缓解 DoS。
+   - 前端库（Vue / Tailwind / Marked）**本地托管**，CSP 脚本源收敛为同源；登录防爆破（同 IP 连续失败锁定）。
+
+9. **服务器性能与稳定性** ⚡：
+   - 有界线程池（线程复用，避免无限新建线程）、HTTP/1.1 keep-alive 连接复用、**gzip 压缩**（页面体积约压缩 80%）、静态资源 ETag/304 与缓存头。
+   - 浏览器任务**全局排队计数**，可在侧边栏实时查看排队人数；队列满载时快速返回 503，避免雪崩。
 
 ---
 
@@ -78,13 +94,15 @@
 ---
 
 ### 第二步：配置文件设置
-1. 在项目根目录下，复制 `\.env.example` 文件，并将其重命名为 **`\.env`**。
-2. 打开 `.env`，填入您的配置：
-   - **`TELEGRAM_BOT_TOKEN`**：填入您通过 Telegram @BotFather 申请到的机器人令牌（如果不使用 Telegram 接口，请留空或保持原样，程序会自适应降级）。
-   - **`USE_NGROK`** 与 **`NGROK_PATH`**：（可选，仅限需要公网访问网页端时配置）。
+1. 在项目根目录下，复制 `\.env.example` 文件，并将其重命名为 **`\.env`**（`start_all.bat` 首次运行时也会自动生成）。
+2. 打开 `.env`，**至少填写以下关键项**：
+   - **`ADMIN_PASSWORD`**（必填，网页登录）：网页端管理员的初始密码。首次启动时会据此创建 `ADMIN_USERNAME`（默认 `admin`）账户。**请务必设置一个强密码**。
+   - **`TELEGRAM_BOT_TOKEN`**：Telegram @BotFather 申请的机器人令牌；不使用 Telegram 时留空，程序自动降级为纯 Web 模式。
+   - **`ALLOWED_TELEGRAM_IDS`**（强烈建议）：允许使用机器人的 Telegram 数字 ID，逗号分隔。留空表示任何人都能使用机器人（有风险）。
+   - **`USE_NGROK`** 与 **`NGROK_PATH`**：（可选）需要公网访问时配置。
 
 > ⚠️ **【重要避坑提示】**：
-> 在 `.env` 配置文件中配置 **`NGROK_PATH`** 等 Windows 路径时，**切勿使用双引号包裹路径**！
+> 在 `.env` 中配置 **`NGROK_PATH`** 等 Windows 路径时，**切勿使用双引号包裹路径**！
 > *错误写法*：`NGROK_PATH="C:\Users\Desktop\ngrok.exe"`
 > *正确写法*：`NGROK_PATH=C:\Users\Desktop\ngrok.exe`
 > 因为解析器会把双引号里的 `\n`（例如 `\ngrok.exe` 中的 `\n`）误当成“换行符”转义，从而导致路径找不到。
@@ -92,34 +110,74 @@
 ---
 
 ### 第三步：一键运行
-直接双击运行项目根目录下的 **`start_all.bat`**：
-1. 脚本会自动检查 Python 并建立 `venv` 虚拟环境。
-2. 自动检查并安装 `requirements.txt` 中的全部 Python 依赖包。
-3. 检查本地 CDP（Chrome 远程调试）端口，如果没有开启，会自动帮您开启一个专用的浏览器窗口，并自动跳转至 `chatgpt.com`。
-4. **【核心步骤】**：请在自动打开的浏览器窗口中**完成您的 ChatGPT 账号登录**（登录后即可保持会话，以后无需重复登录）。
-5. 自动启动后台内网穿透（如有）、Telegram 机器人以及 Streamlit 网页服务。
+- **Windows**：双击运行根目录下的 **`start_all.bat`**。
+- **macOS / Linux**：在终端执行 `./start_all.sh`（首次会自动 `chmod +x` 或用 `bash start_all.sh`）。
+
+启动流程：
+1. 自动检查 Python（Windows 上会依次尝试 `python` 与 `py` 启动器）并建立 `venv` 虚拟环境。
+2. 自动安装 `requirements.txt` 中的全部依赖（**新增登录功能无需任何额外依赖**，均由 Python 标准库实现）。
+3. 自动探测 Chrome / Edge / Chromium（Windows 注册表、macOS、Linux 常见路径与 PATH），检查 CDP 调试端口；未开启则使用项目内的便携用户目录启动浏览器并跳转 `chatgpt.com`。
+4. 初始化网页管理员账户。
+5. **【核心步骤】**：在自动打开的浏览器窗口中**完成您的 ChatGPT 账号登录**（登录态保存在浏览器配置目录，以后无需重复登录）。
+6. 自动启动内网穿透（可选）、Telegram 机器人（可选）与带登录的 Web 服务。
 
 ---
 
 ### 第四步：使用与停止
 * **使用**：
-  - 本地网页端访问：浏览器打开 [http://localhost:8501](http://localhost:8501)。
-  - Telegram 交互：在 Telegram 中找到您的机器人发送 `/start`。
+  - 本地网页端：浏览器打开 [http://localhost:8501](http://localhost:8501)，**首次进入会显示登录页**，输入 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录。
+  - Telegram：在 Telegram 中找到您的机器人发送 `/start`（须在白名单内）。
 * **优雅退出**：
-  - 当您不想使用时，直接在运行 `start_all.bat` 的 CMD 窗口按下 **`Ctrl+C`**，系统会干净利落地关闭包括浏览器调试链接、Ngrok 以及所有 python 服务，释放端口。
+  - 在运行窗口按下 **`Ctrl+C`**，系统会用进程树方式干净地终止 ngrok、bot、web 等所有托管进程并释放端口；**浏览器会保留运行**以维持登录态。
+
+---
+
+## 👥 用户与账号管理
+
+- **首次启动**：根据 `.env` 中的 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 自动创建管理员（仅当该账户不存在时）。
+- **命令行管理账号**（在项目根目录、激活虚拟环境后执行）：
+
+```bash
+venv\Scripts\python.exe auth.py adduser alice Password123   # Windows 建号
+venv/bin/python auth.py adduser bob Password123             # macOS/Linux 建号
+venv\Scripts\python.exe auth.py adduser carol Pw123 --admin # 创建管理员
+venv\Scripts\python.exe auth.py list                        # 列出账户
+venv\Scripts\python.exe auth.py passwd alice NewPassword456 # 重置密码（并使旧会话失效）
+venv\Scripts\python.exe auth.py deluser alice               # 删除账户
+```
+
+- 账户与会话数据保存在 `data/` 目录（已被 `.gitignore` 忽略）：`users.json`（密码哈希）、`sessions.json`（会话）、`secret.key`（服务端密钥，自动生成，请勿泄露）。
+- 若想开放网页端自助注册，将 `.env` 中 `ALLOW_REGISTRATION=True`，注册者默认为普通用户。
+
+---
+
+## 🌐 公网（ngrok / 局域网）暴露安全清单
+
+将网页通过 ngrok 或局域网开放给朋友时，请务必：
+
+1. 在 `.env` 中设置 `WEB_HOST=0.0.0.0`（或 `ALLOW_REMOTE=True`）并设置一个强 `ADMIN_PASSWORD`——所有接口都会强制登录，未登录返回 401。
+2. 设置 `TRUST_FORWARDED_HEADERS=True`，以便透过 ngrok 正确识别真实访客 IP 与 HTTPS（登录 Cookie 会自动带上 `Secure`）。
+3. 配置 `ALLOWED_TELEGRAM_IDS` 限制机器人使用范围。
+4. 仅在需要时开放 `ALLOW_REGISTRATION`，日常保持关闭。
+
+> 服务默认只监听 `127.0.0.1`，不会暴露到局域网/公网。
 
 ---
 
 ## 📂 项目结构
 
-- [start_all.bat](file:///d:/pycharmProject/webgpt2api/start_all.bat)：一键自检、安装、接管与运行批处理文件。
-- [run_all.py](file:///d:/pycharmProject/webgpt2api/run_all.py)：主 Python 编排服务，负责浏览器检测、ngrok 配置、并发子进程运行监控和生命周期统一回收。
-- [bot.py](file:///d:/pycharmProject/webgpt2api/bot.py)：Telegram 机器人逻辑，包含串行 FIFO 排队机制、指令响应和多模态交互。
-- [app_streamlit.py](file:///d:/pycharmProject/webgpt2api/app_streamlit.py)：Streamlit 本地网页前端交互界面。
-- [chatgpt_browser.py](file:///d:/pycharmProject/webgpt2api/chatgpt_browser.py)：基于 Playwright 的底层浏览器操纵驱动，含 CORS 绕过的图片下载及防多进程写冲突文件锁。
-- [config.py](file:///d:/pycharmProject/webgpt2api/config.py)：全局静态参数配置加载。
-- [.env](file:///d:/pycharmProject/webgpt2api/.env)：用户密钥与代理配置文件。
-- [.env.example](file:///d:/pycharmProject/webgpt2api/.env.example)：配置指南模板。
+- **`start_all.bat`** / **`start_all.sh`**：Windows / macOS·Linux 一键自检、安装、接管与运行脚本。
+- **`run_all.py`**：主 Python 编排服务，跨平台负责浏览器探测、ngrok 配置、子进程监控与进程树生命周期回收。
+- **`web_server.py`**：带登录鉴权、安全头、gzip 与线程池的 Web 服务（默认入口，取代旧的 Streamlit 运行方式）。
+- **`auth.py`**：用户认证模块（PBKDF2 密码哈希、服务端会话、登录限流、账号管理 CLI）。
+- **`bot.py`**：Telegram 机器人逻辑，含串行 FIFO 排队、白名单/管理员控制、指令响应和多模态交互。
+- **`app_streamlit.py`**：Streamlit 本地管理员控制台（可选，已加访问密码门）。
+- **`chatgpt_browser.py`**：基于 Playwright 的底层浏览器操纵驱动，含图片下载、跨进程文件锁、跨平台队列计数与健康指标。
+- **`config.py`**：全局配置加载（含 Web、安全、白名单、上传限制、跨平台路径等）。
+- **`static/index.html`**：网页端控制台（Vue 3），含登录/注册页、用户菜单与会话管理。
+- **`static/vendor/`**：本地托管的前端库（Vue / Tailwind / Marked），无需外网 CDN 即可加载。
+- **`data/`**（运行时生成，已 gitignore）：账户、会话与服务端密钥。
+- **`.env.example`**：配置指南模板。
 
 ---
 

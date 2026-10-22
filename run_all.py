@@ -1,186 +1,354 @@
+"""Cross-platform service orchestrator for ChatGPT Share Gate.
+
+Responsibilities
+----------------
+1. Detect / launch a Chromium-based browser with remote debugging enabled.
+2. Start the ngrok tunnel (optional).
+3. Start the Telegram bot (optional).
+4. Start the web server (with authentication).
+5. On exit, terminate the whole process tree cleanly (no orphan processes or
+   port conflicts on Windows).
+
+Runs on Windows, macOS and Linux. The browser is intentionally NOT killed on
+exit - it keeps the ChatGPT login session alive for the next run.
+"""
+
 import subprocess
 import sys
 import os
 import time
 import socket
+import signal
 import threading
 import shutil
-from dotenv import load_dotenv
+import platform
 
 # Reconfigure stdout/stderr to avoid UnicodeEncodeErrors on non-UTF-8 terminals
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(errors='replace')
-if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(errors='replace')
+# (Windows CMD defaults to GBK/CP936).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(errors="replace")
 
-# Load env variables
-load_dotenv()
+# Make sibling modules importable regardless of the launch directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def is_chrome_running(port=9222):
-    """Check if Chrome debugging port 9222 is already open."""
+import config  # noqa: E402
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+# ---------------------------------------------------------------------------
+# Port / process helpers
+# ---------------------------------------------------------------------------
+def is_port_open(host="127.0.0.1", port=9222):
+    """Check whether a TCP port is already accepting connections."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1.0)
         try:
-            s.connect(("127.0.0.1", port))
+            s.connect((host, port))
             return True
-        except (socket.timeout, ConnectionRefusedError):
+        except (socket.timeout, ConnectionRefusedError, OSError):
             return False
 
+
 def stream_output(process, prefix):
-    """Stream process stdout/stderr to sys.stdout with a prefix, supporting multi-encoding fallback."""
+    """Stream subprocess stdout with a prefix, with encoding fallback."""
     try:
-        # Get terminal encoding, default to utf-8
-        terminal_encoding = sys.stdout.encoding or 'utf-8'
-        for line in iter(process.stdout.readline, b''):
-            # Try to decode as UTF-8 first
+        terminal_encoding = sys.stdout.encoding or "utf-8"
+        for line in iter(process.stdout.readline, b""):
             try:
-                decoded = line.decode('utf-8')
+                decoded = line.decode("utf-8")
             except UnicodeDecodeError:
-                # Fallback to terminal/system encoding (e.g., gbk on Windows)
-                decoded = line.decode(terminal_encoding, errors='replace')
+                decoded = line.decode(terminal_encoding, errors="replace")
             sys.stdout.write(f"[{prefix}] {decoded}")
             sys.stdout.flush()
     except Exception as e:
         print(f"[{prefix}] Error reading output: {e}")
 
-def find_ngrok():
-    """Find the path to ngrok executable in PATH, current dir, config, or custom desktop path."""
-    # 1. Check custom path from .env
-    env_path = os.getenv("NGROK_PATH")
-    if env_path:
-        env_path = env_path.strip('\'"').strip()
-        if os.path.exists(env_path):
-            return env_path
-        
-    # 2. Check project root folder
-    for name in ["ngrok.exe", "ngrok"]:
-        local_path = os.path.join(os.getcwd(), name)
-        if os.path.exists(local_path):
-            return local_path
-            
-    # 3. Check system PATH
-    system_path = shutil.which("ngrok")
-    if system_path:
-        return system_path
-        
-    # 4. Check specific user fallback paths
-    for path in [
-        r"C:\Users\86150\Desktop\微信\电脑\ngrok.exe",
-        r"C:\Users\86150\Desktop\ħ\͸\ngrok.exe"
-    ]:
-        if os.path.exists(path):
-            return path
-            
-    return None
 
-def find_chrome():
-    """Find the path to Google Chrome or Microsoft Edge executable on Windows."""
-    # 1. Check system PATH
-    for name in ["chrome.exe", "chrome", "msedge.exe", "msedge"]:
+def detached_popen_kwargs():
+    """Keyword args that let the orchestrator kill the whole process tree."""
+    if IS_WINDOWS:
+        # Independent process group so Ctrl+C is not forwarded automatically;
+        # we manage the lifecycle ourselves (taskkill /T).
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    # POSIX: child gets its own session/process group (killpg on shutdown).
+    return {"start_new_session": True}
+
+
+def terminate_process_tree(proc, name):
+    """Terminate a process and ALL its children (cross-platform)."""
+    if proc is None or proc.poll() is not None:
+        return
+    print(f"Terminating {name} (PID {proc.pid})...")
+    if IS_WINDOWS:
+        # /T kills the tree, /F forces; ignores failures if already gone.
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc.kill()
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            proc.terminate()
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    # Force kill if still alive.
+    if IS_WINDOWS:
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except OSError:
+            proc.kill()
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        print(f"[WARNING] {name} did not fully exit.")
+
+
+# ---------------------------------------------------------------------------
+# Python / venv resolution (cross-platform)
+# ---------------------------------------------------------------------------
+def find_venv_python():
+    """Return the project venv interpreter, falling back to the system one."""
+    if IS_WINDOWS:
+        candidates = [
+            os.path.join(config.BASE_DIR, "venv", "Scripts", "python.exe"),
+            os.path.join(config.BASE_DIR, ".venv", "Scripts", "python.exe"),
+        ]
+    else:
+        candidates = [
+            os.path.join(config.BASE_DIR, "venv", "bin", "python"),
+            os.path.join(config.BASE_DIR, ".venv", "bin", "python"),
+        ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return sys.executable
+
+
+# ---------------------------------------------------------------------------
+# Browser discovery (Windows / macOS / Linux)
+# ---------------------------------------------------------------------------
+def _find_browser_windows():
+    # 1. PATH
+    for name in ("chrome.exe", "msedge.exe"):
         path = shutil.which(name)
         if path:
-            return path, ("edge" if "edge" in name.lower() else "chrome")
-            
-    # 2. Try common Google Chrome paths
-    chrome_paths = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            return path, "edge" if "edge" in name.lower() else "chrome"
+    # 2. Registry "App Paths" (most reliable on Windows)
+    try:
+        import winreg
+    except ImportError:
+        winreg = None
+    if winreg:
+        app_paths_root = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+        for app_name, kind in (("chrome.exe", "chrome"), ("msedge.exe", "edge")):
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for access in (
+                    winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+                    winreg.KEY_READ | winreg.KEY_WOW64_32KEY,
+                ):
+                    try:
+                        key = winreg.OpenKey(
+                            hive,
+                            app_paths_root + "\\" + app_name,
+                            0,
+                            access,
+                        )
+                        value, _ = winreg.QueryValueEx(key, "")
+                        winreg.CloseKey(key)
+                        value = value.strip().strip('"')
+                        if value and os.path.exists(value):
+                            return value, kind
+                    except OSError:
+                        continue
+    # 3. Well-known install paths
+    program_files = [
+        os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+        os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+        os.environ.get("LOCALAPPDATA", ""),
     ]
-    if "LOCALAPPDATA" in os.environ:
-        chrome_paths.append(os.path.join(os.environ["LOCALAPPDATA"], "Google", "Chrome", "Application", "chrome.exe"))
-        
-    for path in chrome_paths:
-        if os.path.exists(path):
-            return path, "chrome"
-            
-    # 3. Try common Microsoft Edge paths (fallback)
-    edge_paths = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
-    for path in edge_paths:
-        if os.path.exists(path):
-            return path, "edge"
-            
+    chrome_rel = os.path.join("Google", "Chrome", "Application", "chrome.exe")
+    edge_rel = os.path.join("Microsoft", "Edge", "Application", "msedge.exe")
+    for base in program_files:
+        if not base:
+            continue
+        for rel, kind in ((chrome_rel, "chrome"), (edge_rel, "edge")):
+            candidate = os.path.join(base, rel)
+            if os.path.exists(candidate):
+                return candidate, kind
     return None, None
+
+
+def _find_browser_mac():
+    candidates = [
+        ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "chrome"),
+        ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "edge"),
+        ("/Applications/Chromium.app/Contents/MacOS/Chromium", "chrome"),
+        (os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"), "chrome"),
+    ]
+    for path, kind in candidates:
+        if os.path.exists(path):
+            return path, kind
+    for name in ("google-chrome", "chromium", "microsoft-edge"):
+        path = shutil.which(name)
+        if path:
+            return path, "edge" if "edge" in name else "chrome"
+    return None, None
+
+
+def _find_browser_linux():
+    for name in ("google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser", "microsoft-edge", "chrome"):
+        path = shutil.which(name)
+        if path:
+            return path, "edge" if "edge" in name else "chrome"
+    for path in (
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/microsoft-edge",
+        "/opt/google/chrome/chrome",
+    ):
+        if os.path.exists(path):
+            return path, "edge" if "edge" in path else "chrome"
+    return None, None
+
+
+def find_browser():
+    """Return (executable_path, browser_kind) or (None, None)."""
+    if IS_WINDOWS:
+        return _find_browser_windows()
+    if IS_MAC:
+        return _find_browser_mac()
+    return _find_browser_linux()
+
+
+def launch_browser(debug_port):
+    """Launch the browser with remote debugging unless the port is open."""
+    if is_port_open(config.CDP_HOST, debug_port):
+        print(f"[1/4] Browser is already running with debugging port {debug_port}.")
+        return
+    print("[1/4] Starting Browser...")
+    browser_bin, browser_type = find_browser()
+    if not browser_bin:
+        print("⚠️ [WARNING] No Google Chrome / Microsoft Edge / Chromium was found!")
+        print("          Please install a Chromium browser, or launch it manually on the")
+        print(f"          debugging port {debug_port}.")
+        return
+
+    profile_dir = config.BROWSER_PROFILE_DIR
+    os.makedirs(profile_dir, exist_ok=True)
+
+    browser_cmd = [
+        browser_bin,
+        f"--user-data-dir={profile_dir}",
+        f"--remote-debugging-port={debug_port}",
+        f"--remote-debugging-address={config.CDP_HOST}",
+        "https://chatgpt.com",
+    ]
+    try:
+        subprocess.Popen(
+            browser_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **detached_popen_kwargs(),
+        )
+        print(f"      Started {browser_type.capitalize()}: {browser_bin}")
+        print(f"      Profile path: {profile_dir}")
+        print("      Waiting for the browser to initialize...")
+        # Poll the port instead of a blind fixed sleep.
+        for _ in range(20):
+            if is_port_open(config.CDP_HOST, debug_port):
+                break
+            time.sleep(0.5)
+        time.sleep(2)
+    except Exception as e:
+        print(f"⚠️ Error starting browser: {e}")
+
+
+# ---------------------------------------------------------------------------
+# ngrok discovery
+# ---------------------------------------------------------------------------
+def find_ngrok():
+    """Find ngrok in .env, project directory, or PATH (cross-platform)."""
+    env_path = os.getenv("NGROK_PATH", "").strip().strip("'\"")
+    if env_path and os.path.exists(env_path):
+        return env_path
+    for name in ("ngrok.exe", "ngrok"):
+        local_path = os.path.join(config.BASE_DIR, name)
+        if os.path.exists(local_path):
+            return local_path
+    return shutil.which("ngrok")
+
 
 def main():
     print("============================================")
     print("  ChatGPT Share Gate Services Starter")
+    print(f"  Platform: {platform.platform()}")
     print("============================================")
     print()
 
-    # 1. Chrome Check/Start
-    if is_chrome_running():
-        print("[1/4] Chrome is already running on port 9222.")
-    else:
-        print("[1/4] Starting Browser...")
-        browser_bin, browser_type = find_chrome()
-        if not browser_bin:
-            print("⚠️ [WARNING] Neither Google Chrome nor Microsoft Edge was found on your system!")
-            print("          Please install a Chromium browser or launch it manually on port 9222.")
-        else:
-            profile_dir = r"C:\Users\86150\Chrome_Hermes_Profile"
-            if not os.path.exists(profile_dir):
-                profile_dir = os.path.join(os.getcwd(), "chrome-dev-profile")
-                
-            chrome_cmd = [
-                browser_bin,
-                f"--user-data-dir={profile_dir}",
-                "--remote-debugging-port=9222",
-                "https://chatgpt.com"
-            ]
-            try:
-                subprocess.Popen(chrome_cmd)
-                print(f"      Started {browser_type.capitalize()} successfully using: {browser_bin}")
-                print(f"      Profile path: {profile_dir}")
-                print("      Waiting 8s for browser to initialize...")
-                time.sleep(8)
-            except Exception as e:
-                print(f"⚠️ Error starting browser: {e}. Make sure Chrome or Edge is installed or running manually.")
+    web_port = config.WEB_PORT
 
-    # Locate executable paths
-    python_exe = os.path.join("venv", "Scripts", "python.exe")
-    streamlit_exe = os.path.join("venv", "Scripts", "streamlit.exe")
-    
-    if not os.path.exists(python_exe):
-        python_exe = sys.executable
-        print(f"ℹ️ Venv python not found, fallback to system: {python_exe}")
-    if not os.path.exists(streamlit_exe):
-        streamlit_exe = "streamlit"
-        print(f"ℹ️ Venv streamlit not found, fallback to global 'streamlit'")
+    # 1. Browser
+    launch_browser(config.CDP_PORT)
 
-    # Set environment variables (unbuffer stdout)
+    python_exe = find_venv_python()
+    print(f"ℹ️ Using Python interpreter: {python_exe}")
+
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    # Start ngrok if enabled
+    # 2. ngrok
     use_ngrok = os.getenv("USE_NGROK", "True").strip().lower() in ("true", "1", "yes")
     ngrok_process = None
-
     if use_ngrok:
         print("[2/4] Starting Ngrok Tunnel...")
         ngrok_bin = find_ngrok()
         if not ngrok_bin:
-            print("⚠️ [WARNING] ngrok executable not found in PATH, current folder, or config. Skipping tunnel.")
-            print("          Streamlit local server will still be running at http://localhost:8501.")
-            print("          To expose it externally, please install ngrok or configure NGROK_PATH in .env.")
+            print("⚠️ [WARNING] ngrok not found. Skipping tunnel; the web UI stays local.")
+            print(f"          Local access: http://localhost:{web_port}")
         else:
             tunnel_url = os.getenv("NGROK_TUNNEL_URL", "").strip()
             ngrok_cmd = [ngrok_bin, "http"]
             if tunnel_url:
                 ngrok_cmd.append(f"--url={tunnel_url}")
-            ngrok_cmd.extend(["8501", "--host-header=localhost:8501"])
-
+            ngrok_cmd.extend([str(web_port), f"--host-header=localhost:{web_port}"])
             try:
                 ngrok_process = subprocess.Popen(
                     ngrok_cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT
+                    stderr=subprocess.STDOUT,
+                    **detached_popen_kwargs(),
                 )
-                t_ngrok = threading.Thread(target=stream_output, args=(ngrok_process, "Ngrok"), daemon=True)
-                t_ngrok.start()
-                print(f"      Ngrok started successfully using: {ngrok_bin}")
+                threading.Thread(
+                    target=stream_output, args=(ngrok_process, "Ngrok"), daemon=True
+                ).start()
+                print(f"      Ngrok started: {ngrok_bin}")
                 if tunnel_url:
                     print(f"      Tunnel URL: https://{tunnel_url}")
                 time.sleep(2)
@@ -189,55 +357,73 @@ def main():
     else:
         print("[2/4] Ngrok is disabled in configuration.")
 
-    # Check if Telegram Bot token is configured
+    # 3. Telegram bot
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    is_bot_configured = bot_token and bot_token != "YOUR_BOT_TOKEN_HERE"
+    is_bot_configured = bool(bot_token and bot_token != "YOUR_BOT_TOKEN_HERE")
     bot_process = None
-
     if is_bot_configured:
         print("[3/4] Starting Telegram Bot...")
         try:
             bot_process = subprocess.Popen(
-                [python_exe, "bot.py"],
+                [python_exe, os.path.join(config.BASE_DIR, "bot.py")],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                env=env
+                cwd=config.BASE_DIR,
+                env=env,
+                **detached_popen_kwargs(),
             )
-            t_bot = threading.Thread(target=stream_output, args=(bot_process, "Bot"), daemon=True)
-            t_bot.start()
+            threading.Thread(
+                target=stream_output, args=(bot_process, "Bot"), daemon=True
+            ).start()
         except Exception as e:
             print(f"❌ Failed to start Telegram Bot: {e}")
     else:
-        print("[3/4] Telegram Bot is skipped (TELEGRAM_BOT_TOKEN is not set or set to placeholder).")
+        print("[3/4] Telegram Bot skipped (TELEGRAM_BOT_TOKEN not set).")
 
     time.sleep(2)
 
+    # 4. Web server
     print("[4/4] Starting Web Server...")
     web_process = None
     try:
         web_process = subprocess.Popen(
-            [python_exe, "web_server.py"],
+            [python_exe, os.path.join(config.BASE_DIR, "web_server.py")],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            env=env
+            cwd=config.BASE_DIR,
+            env=env,
+            **detached_popen_kwargs(),
         )
-        t_web = threading.Thread(target=stream_output, args=(web_process, "WebServer"), daemon=True)
-        t_web.start()
+        threading.Thread(
+            target=stream_output, args=(web_process, "WebServer"), daemon=True
+        ).start()
     except Exception as e:
         print(f"❌ Failed to start Web Server: {e}")
 
     print()
     print("============================================")
-    print("  All services running under this window.")
+    print(f"  Web UI:  http://localhost:{web_port}")
     print("  Press Ctrl+C to terminate all services.")
     print("============================================")
     print()
 
+    stopping = False
+
+    def request_stop(signum=None, frame=None):
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
+        print("\n[Interrupt] Terminating all services...")
+
+    if not IS_WINDOWS:
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+
     try:
         ngrok_warned_dead = False
-        while True:
+        while not stopping:
             time.sleep(1)
-            # Check if any process exited unexpectedly
             if bot_process and bot_process.poll() is not None:
                 print("⚠️ Telegram Bot process terminated unexpectedly.")
                 break
@@ -248,37 +434,14 @@ def main():
                 print("⚠️ Ngrok tunnel process terminated unexpectedly.")
                 ngrok_warned_dead = True
     except KeyboardInterrupt:
-        print("\n[Ctrl+C detected] Terminating all services...")
+        request_stop()
     finally:
-        # Clean termination
-        if bot_process and bot_process.poll() is None:
-            print("Terminating Telegram Bot...")
-            bot_process.terminate()
-        if web_process and web_process.poll() is None:
-            print("Terminating Web Server...")
-            web_process.terminate()
-        if ngrok_process and ngrok_process.poll() is None:
-            print("Terminating Ngrok...")
-            ngrok_process.terminate()
+        # Stop the managed services; the browser is deliberately kept alive.
+        terminate_process_tree(bot_process, "Telegram Bot")
+        terminate_process_tree(web_process, "Web Server")
+        terminate_process_tree(ngrok_process, "Ngrok")
+        print("All managed processes stopped (browser left running).")
 
-        # Wait for processes to exit
-        if bot_process:
-            try:
-                bot_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                bot_process.kill()
-        if web_process:
-            try:
-                web_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                web_process.kill()
-        if ngrok_process:
-            try:
-                ngrok_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                ngrok_process.kill()
-        
-        print("All processes stopped.")
 
 if __name__ == "__main__":
     main()

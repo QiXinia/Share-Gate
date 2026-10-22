@@ -78,6 +78,11 @@ class ChatGPTBrowser:
         # Cross-process file lock — prevents bot.py and Streamlit from
         # controlling the browser at the same time.
         self._file_lock = _FileLock(os.path.join(self.temp_dir, ".browser.lock"))
+        # Queue / health metrics (mutated only from the asyncio loop thread).
+        self.pending_count = 0   # tasks accepted, including the one running
+        self.active_count = 0    # tasks currently driving the browser
+        self.total_completed = 0
+        self.last_activity_at = None
 
     async def start(self):
         """Connect to the Chrome instance via CDP and find/open the ChatGPT page."""
@@ -200,11 +205,19 @@ class ChatGPTBrowser:
         Uses both an asyncio.Lock (intra-process) and a file lock (cross-process)
         to ensure only one caller drives the browser at any given time.
         """
-        async with self.lock:
-            return await self._send_message_inner(prompt, image_path, file_paths, features, timeout_minutes)
+        self.pending_count += 1
+        self.last_activity_at = time.time()
+        try:
+            async with self.lock:
+                return await self._send_message_inner(prompt, image_path, file_paths, features, timeout_minutes)
+        finally:
+            self.pending_count = max(0, self.pending_count - 1)
+            self.total_completed += 1
+            self.last_activity_at = time.time()
 
     async def _send_message_inner(self, prompt, image_path=None, file_paths=None, features=None, timeout_minutes=6):
         """Inner implementation of send_message, called while holding the asyncio lock."""
+        self.active_count += 1
         # Acquire cross-process file lock in a thread so we don't block the event loop
         loop = asyncio.get_running_loop()
         lock_ctx = self._file_lock.acquire()
@@ -212,7 +225,10 @@ class ChatGPTBrowser:
         try:
             return await self._do_send_message(prompt, image_path, file_paths, features, timeout_minutes)
         finally:
-            await loop.run_in_executor(None, lock_ctx.__exit__, None, None, None)
+            try:
+                await loop.run_in_executor(None, lock_ctx.__exit__, None, None, None)
+            finally:
+                self.active_count = max(0, self.active_count - 1)
 
     async def _do_send_message(self, prompt, image_path=None, file_paths=None, features=None, timeout_minutes=6):
         """Core send-message logic, called while holding both locks."""
@@ -569,14 +585,23 @@ class ChatGPTBrowser:
         Acquires both the asyncio lock and the cross-process file lock
         to prevent conflicts with any concurrent send_message calls.
         """
-        async with self.lock:
-            loop = asyncio.get_running_loop()
-            lock_ctx = self._file_lock.acquire()
-            await loop.run_in_executor(None, lock_ctx.__enter__)
-            try:
-                return await self._do_new_chat()
-            finally:
-                await loop.run_in_executor(None, lock_ctx.__exit__, None, None, None)
+        self.pending_count += 1
+        self.active_count += 1
+        self.last_activity_at = time.time()
+        try:
+            async with self.lock:
+                loop = asyncio.get_running_loop()
+                lock_ctx = self._file_lock.acquire()
+                await loop.run_in_executor(None, lock_ctx.__enter__)
+                try:
+                    return await self._do_new_chat()
+                finally:
+                    await loop.run_in_executor(None, lock_ctx.__exit__, None, None, None)
+        finally:
+            self.pending_count = max(0, self.pending_count - 1)
+            self.active_count = max(0, self.active_count - 1)
+            self.total_completed += 1
+            self.last_activity_at = time.time()
 
     async def _do_new_chat(self):
         """Inner new_chat implementation, called while holding both locks."""
@@ -592,15 +617,22 @@ class ChatGPTBrowser:
             return {"status": "error", "message": f"创建新会话失败: {e}"}
 
     async def get_status(self):
-        """Returns browser connection status and active tab information."""
+        """Returns browser connection status, active tab and queue metrics."""
+        queue_info = {
+            "pending": self.pending_count,
+            "active": self.active_count,
+            "waiting": max(0, self.pending_count - self.active_count),
+            "total_completed": self.total_completed,
+            "last_activity_at": self.last_activity_at,
+        }
         if not self.page or self.page.is_closed():
-            return {"status": "disconnected", "url": "N/A", "title": "N/A"}
+            return {"status": "disconnected", "url": "N/A", "title": "N/A", "queue": queue_info}
         try:
             title = await self.page.title()
             url = self.page.url
-            return {"status": "connected", "url": url, "title": title}
+            return {"status": "connected", "url": url, "title": title, "queue": queue_info}
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": str(e), "queue": queue_info}
 
 
 

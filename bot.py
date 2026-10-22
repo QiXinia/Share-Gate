@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+from functools import wraps
 from telegram import Update, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,6 +14,64 @@ from telegram.request import HTTPXRequest
 
 import config
 from chatgpt_browser import ChatGPTBrowser
+
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+def is_user_allowed(user_id: int) -> bool:
+    """Empty whitelist means the bot is open to everyone (legacy behavior)."""
+    if not config.ALLOWED_TELEGRAM_IDS:
+        return True
+    return user_id in config.ALLOWED_TELEGRAM_IDS
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in config.TELEGRAM_ADMIN_IDS
+
+
+def restricted(handler):
+    """Reject users that are not in the Telegram whitelist."""
+    @wraps(handler)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user is None:
+            return
+        if not is_user_allowed(user.id):
+            logger.warning(
+                "Access denied for Telegram user id=%s username=%s",
+                user.id, user.username,
+            )
+            if update.message:
+                whitelist = ",".join(str(i) for i in config.ALLOWED_TELEGRAM_IDS) or "(未配置)"
+                await update.message.reply_text(
+                    "⛔ **访问被拒绝**\n\n"
+                    "您不在该机器人的允许名单中，无法使用此服务。\n"
+                    f"您的 Telegram ID 是：`{user.id}`\n"
+                    "请联系管理员将该 ID 加入 `.env` 的 `ALLOWED_TELEGRAM_IDS`。",
+                    parse_mode="Markdown"
+                )
+            return
+        return await handler(update, context)
+    return wrapped
+
+
+def admin_only(handler):
+    """Restrict a command to configured Telegram administrators."""
+    @wraps(handler)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user is None or not is_admin(user.id):
+            logger.warning(
+                "Admin command denied for Telegram user id=%s (admins=%s)",
+                user.id if user else None,
+                sorted(config.TELEGRAM_ADMIN_IDS),
+            )
+            if update.message:
+                await update.message.reply_text("⛔ 该指令仅限管理员使用。")
+            return
+        return await handler(update, context)
+    return wrapped
 
 # Shared logger config supporting both bot.log file and console stream
 logging.basicConfig(
@@ -33,6 +92,7 @@ browser = ChatGPTBrowser(cdp_url=config.CDP_URL, temp_dir=config.TEMP_DIR)
 queue_counter = 0
 queue_lock = asyncio.Lock()
 
+@restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends a greeting message when /start is run."""
     welcome_text = (
@@ -185,12 +245,14 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
         async with queue_lock:
             queue_counter = max(0, queue_counter - 1)
 
+@restricted
 async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Triggered on plain text messages."""
     prompt = update.message.text
     # Run request in background task so Telegram handlers don't block
     asyncio.create_task(handle_request(update, context, prompt=prompt))
 
+@restricted
 async def on_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Triggered when user sends an image (with or without caption)."""
     photo_file = await update.message.photo[-1].get_file()
@@ -206,6 +268,7 @@ async def on_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Queue up the request
     asyncio.create_task(handle_request(update, context, prompt=caption, image_path=local_path))
 
+@restricted
 async def on_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Triggered when user sends a general document or file (with or without caption)."""
     doc = update.message.document
@@ -224,6 +287,7 @@ async def on_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Queue up the request
     asyncio.create_task(handle_request(update, context, prompt=caption, file_paths=[local_path]))
 
+@restricted
 async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to start a fresh ChatGPT conversation session.
     
@@ -265,6 +329,7 @@ async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with queue_lock:
             queue_counter = max(0, queue_counter - 1)
 
+@restricted
 async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to retrieve current browser connection and queue status."""
     browser_info = await browser.get_status()
@@ -278,8 +343,10 @@ async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(status_text)
 
+@restricted
+@admin_only
 async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to fetch the last 20 lines of the execution log."""
+    """Command to fetch the last 20 lines of the execution log (admin only)."""
     log_path = "bot.log"
     if not os.path.exists(log_path):
         await update.message.reply_text("❌ 暂无日志文件。")
@@ -296,6 +363,7 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ 读取日志出错: {e}")
 
+@restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to show help details."""
     help_text = (
@@ -315,7 +383,17 @@ def main():
         return
 
     logger.info("Initializing Telegram Bot...")
-    
+    if config.ALLOWED_TELEGRAM_IDS:
+        logger.info("Telegram access whitelist enabled: %s",
+                    sorted(config.ALLOWED_TELEGRAM_IDS))
+    else:
+        logger.warning(
+            "ALLOWED_TELEGRAM_IDS is empty — the bot is OPEN to every Telegram "
+            "user who can find it. Configure a whitelist in .env for safety."
+        )
+    if config.TELEGRAM_ADMIN_IDS:
+        logger.info("Telegram admins: %s", sorted(config.TELEGRAM_ADMIN_IDS))
+
     # Build application with proxy settings if defined
     builder = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN)
     

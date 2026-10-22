@@ -4,10 +4,12 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ChatGPT 控制台</title>
-    <!-- CDN Imports -->
-    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Locally hosted libraries (self-hosted for reliability, offline use
+         and a stricter Content-Security-Policy; see static/vendor/) -->
+    <script src="vendor/vue.global.prod.js"></script>
+    <script src="vendor/tailwindcss-browser.js"></script>
+    <script src="vendor/marked.min.js"></script>
+    <!-- Icon font + fonts are style-only assets, restricted by CSP below -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     
     <script>
@@ -33,6 +35,11 @@
             font-family: 'Inter', sans-serif;
             transition: background-color 0.3s, color 0.3s;
         }
+
+        [v-cloak] { display: none !important; }
+
+        /* Dark-mode background for the login screen wrapper */
+        .dark .login-card { background-color: #171717; }
         
         /* Monospace font for code blocks */
         code, pre {
@@ -85,7 +92,62 @@
 </head>
 <body class="h-full bg-white dark:bg-chatBg">
     <div id="app" class="h-full" v-cloak>
-        <div :class="['h-full flex overflow-hidden w-full', isDarkMode ? 'dark bg-chatBg text-textColor' : 'bg-white text-[#0d0d0d]']">
+        <!-- =============== 登录 / 注册 全屏视图 =============== -->
+        <div v-if="!currentUser" class="min-h-full w-full flex items-center justify-center px-4"
+             :class="isDarkMode ? 'dark bg-chatBg text-textColor' : 'bg-[#f7f7f8] text-[#0d0d0d]'">
+            <div class="w-full max-w-sm rounded-2xl border shadow-xl p-8"
+                 :class="isDarkMode ? 'bg-sidebarBg border-white/10' : 'bg-white border-black/5'">
+                <div class="flex flex-col items-center mb-6">
+                    <img src="https://upload.wikimedia.org/wikipedia/commons/0/04/ChatGPT_logo.svg"
+                         class="w-12 h-12 mb-3" :class="isDarkMode ? 'dark:invert-[0.9]' : ''" />
+                    <h1 class="text-xl font-bold">ChatGPT Share Gate</h1>
+                    <p class="text-xs mt-1 text-gray-500 dark:text-textMuted">
+                        {{ authMode === 'login' ? '请登录后使用共享控制台' : '注册新账户' }}
+                    </p>
+                </div>
+
+                <form @submit.prevent="submitAuth" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-medium mb-1.5 text-gray-500 dark:text-textMuted">用户名</label>
+                        <input v-model="authForm.username" type="text" autocomplete="username" required
+                               class="w-full rounded-lg border px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-[#10a37f]/40 transition"
+                               :class="isDarkMode ? 'bg-chatBg border-white/15 text-textColor' : 'bg-white border-black/10 text-[#0d0d0d]'"
+                               placeholder="请输入用户名" />
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium mb-1.5 text-gray-500 dark:text-textMuted">密码</label>
+                        <input v-model="authForm.password" type="password" autocomplete="current-password" required
+                               class="w-full rounded-lg border px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-[#10a37f]/40 transition"
+                               :class="isDarkMode ? 'bg-chatBg border-white/15 text-textColor' : 'bg-white border-black/10 text-[#0d0d0d]'"
+                               placeholder="请输入密码" />
+                    </div>
+
+                    <div v-if="authError" class="text-xs text-red-500 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+                        {{ authError }}
+                    </div>
+
+                    <button type="submit" :disabled="authLoading"
+                            class="w-full rounded-lg bg-[#10a37f] hover:bg-[#0e8f6f] disabled:opacity-60 text-white text-sm font-medium py-2.5 transition">
+                        {{ authLoading ? '请稍候...' : (authMode === 'login' ? '登 录' : '注册并登录') }}
+                    </button>
+                </form>
+
+                <div class="mt-4 text-center text-xs text-gray-500 dark:text-textMuted">
+                    <template v-if="authMode === 'login'">
+                        还没有账户？
+                        <a v-if="allowRegistration" href="#" @click.prevent="switchAuthMode('register')" class="text-[#10a37f] hover:underline">立即注册</a>
+                        <span v-else class="text-gray-400">本站未开放注册，请联系管理员</span>
+                    </template>
+                    <template v-else>
+                        已有账户？
+                        <a href="#" @click.prevent="switchAuthMode('login')" class="text-[#10a37f] hover:underline">返回登录</a>
+                    </template>
+                </div>
+            </div>
+        </div>
+
+        <!-- =============== 主应用（登录后可见） =============== -->
+        <div v-else :class="['h-full flex overflow-hidden w-full', isDarkMode ? 'dark bg-chatBg text-textColor' : 'bg-white text-[#0d0d0d]']">
             <!-- Global file input helper -->
             <input type="file" ref="fileInput" multiple @change="onFilesSelected" class="hidden" />
 
@@ -185,18 +247,29 @@
                         {{ browserStatus.status === 'connected' ? 'Connected' : 'Disconnected' }}
                     </span>
                 </div>
+                <div v-if="queueWaiting > 0" class="flex items-center justify-between">
+                    <span class="text-gray-500 dark:text-textMuted">排队任务:</span>
+                    <span class="text-amber-500 font-medium">{{ queueWaiting }} 个等待中</span>
+                </div>
             </div>
-            
-            <!-- boy tf Profile circular layout -->
+
+            <!-- 当前登录用户 -->
             <div class="flex items-center justify-between pt-1">
-                <div class="flex items-center gap-3">
-                    <div class="w-8 h-8 rounded-full bg-[#10a37f] text-white flex items-center justify-center font-bold text-xs select-none">BT</div>
-                    <div class="flex flex-col text-xs leading-none">
-                        <span class="font-semibold text-black dark:text-textColor">boy tf</span>
-                        <span class="text-[10px] text-gray-500 dark:text-textMuted mt-1">Go</span>
+                <div class="flex items-center gap-3 min-w-0">
+                    <div class="w-8 h-8 shrink-0 rounded-full bg-[#10a37f] text-white flex items-center justify-center font-bold text-xs select-none uppercase">
+                        {{ userInitial }}
+                    </div>
+                    <div class="flex flex-col text-xs leading-none min-w-0">
+                        <span class="font-semibold text-black dark:text-textColor truncate">{{ currentUser.username }}</span>
+                        <span class="text-[10px] text-gray-500 dark:text-textMuted mt-1">
+                            {{ currentUser.role === 'admin' ? '管理员' : '普通用户' }}
+                        </span>
                     </div>
                 </div>
-                <button @click="resetSession" class="text-[#2f2f2f] dark:text-textMuted hover:text-black dark:hover:text-white p-1" title="重置会话"><i class="fa-solid fa-arrows-rotate text-sm"></i></button>
+                <div class="flex items-center gap-1 shrink-0">
+                    <button @click="resetSession" class="text-[#2f2f2f] dark:text-textMuted hover:text-black dark:hover:text-white p-1.5" title="重置会话"><i class="fa-solid fa-arrows-rotate text-sm"></i></button>
+                    <button @click="logout" class="text-[#2f2f2f] dark:text-textMuted hover:text-red-500 p-1.5" title="退出登录"><i class="fa-solid fa-right-from-bracket text-sm"></i></button>
+                </div>
             </div>
         </div>
     </aside>
@@ -731,8 +804,17 @@
             const inputText = ref('');
             const attachedFiles = ref([]);
             const loading = ref(false);
-            const browserStatus = ref({ status: 'disconnected', url: 'N/A', title: 'N/A' });
+            const browserStatus = ref({ status: 'disconnected', url: 'N/A', title: 'N/A', queue: {} });
             const isDarkMode = ref(false); // Default to Light Mode matching Screenshot
+
+            // ---- Authentication state ----
+            const currentUser = ref(null);
+            const authMode = ref('login');
+            const authForm = ref({ username: '', password: '' });
+            const authError = ref('');
+            const authLoading = ref(false);
+            const allowRegistration = ref(false);
+            let statusTimer = null;
 
             // Sidebar, Header Models & Toasts States
             const isSidebarOpen = ref(true);
@@ -760,6 +842,36 @@
             const activeSession = computed(() => {
                 return sessions.value.find(s => s.id === activeSessionId.value) || { id: null, title: '', messages: [] };
             });
+
+            // Auth-derived display values
+            const userInitial = computed(() => {
+                const name = currentUser.value?.username || '?';
+                return name.charAt(0).toUpperCase();
+            });
+            const queueWaiting = computed(() => browserStatus.value?.queue?.waiting || 0);
+
+            // Unified fetch wrapper: same-origin cookies + global 401 handling.
+            // Returns the parsed JSON response, or throws an Error with .status.
+            const apiFetch = async (url, options = {}) => {
+                const opts = { credentials: 'same-origin', ...options };
+                if (opts.body && !opts.headers) opts.headers = { 'Content-Type': 'application/json' };
+                const res = await fetch(url, opts);
+                let data = null;
+                try { data = await res.json(); } catch (e) { data = {}; }
+                if (res.status === 401) {
+                    // Session expired / missing -> force back to login.
+                    currentUser.value = null;
+                    if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+                    throw new Error(data.message || '登录已过期，请重新登录');
+                }
+                if (!res.ok) {
+                    const err = new Error(data.message || `请求失败 (${res.status})`);
+                    err.status = res.status;
+                    err.data = data;
+                    throw err;
+                }
+                return data;
+            };
 
             // Auto height for textarea
             const adjustTextareaHeight = () => {
@@ -1009,22 +1121,92 @@
                 return (bytes / 1048576).toFixed(1) + ' MB';
             };
 
-            // Status APIs
-            const fetchStatus = async () => {
+            // ---------------- Authentication ----------------
+            const switchAuthMode = (mode) => {
+                authMode.value = mode;
+                authError.value = '';
+                authForm.value = { username: '', password: '' };
+            };
+
+            const fetchAuthConfig = async () => {
                 try {
-                    const res = await fetch('/api/status');
-                    const data = await res.json();
+                    const data = await fetch('/api/auth/config').then(r => r.json());
+                    allowRegistration.value = !!data.allow_registration;
+                } catch (e) {
+                    allowRegistration.value = false;
+                }
+            };
+
+            const fetchMe = async () => {
+                try {
+                    const data = await fetch('/api/auth/me', { credentials: 'same-origin' }).then(r => r.json());
+                    if (data && data.user) {
+                        currentUser.value = data.user;
+                        return true;
+                    }
+                } catch (e) { /* not logged in */ }
+                currentUser.value = null;
+                return false;
+            };
+
+            const submitAuth = async () => {
+                authError.value = '';
+                const username = (authForm.value.username || '').trim();
+                const password = authForm.value.password || '';
+                if (!username || !password) {
+                    authError.value = '请输入用户名和密码';
+                    return;
+                }
+                authLoading.value = true;
+                try {
+                    const endpoint = authMode.value === 'login' ? '/api/auth/login' : '/api/auth/register';
+                    const data = await apiFetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username, password })
+                    });
+                    currentUser.value = data.user;
+                    authForm.value = { username: '', password: '' };
+                    startStatusPolling();
+                } catch (e) {
+                    authError.value = e.message || '登录失败，请重试';
+                } finally {
+                    authLoading.value = false;
+                }
+            };
+
+            const logout = async () => {
+                if (!confirm('确定退出登录吗？')) return;
+                try {
+                    await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+                } catch (e) { /* ignore */ }
+                currentUser.value = null;
+                if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+                browserStatus.value = { status: 'disconnected', url: 'N/A', title: 'N/A', queue: {} };
+            };
+
+            // ---------------- Status & queue ----------------
+            const fetchStatus = async () => {
+                if (!currentUser.value) return;
+                try {
+                    const data = await apiFetch('/api/status');
                     browserStatus.value = data;
                 } catch (e) {
-                    console.error('Failed to get status:', e);
+                    // 401 is handled by apiFetch; only log other errors.
+                    if (e.status !== 401) console.error('Failed to get status:', e);
                 }
+            };
+
+            const startStatusPolling = () => {
+                fetchStatus();
+                if (statusTimer) clearInterval(statusTimer);
+                statusTimer = setInterval(fetchStatus, 15000);
             };
 
             const resetSession = async () => {
                 if (!confirm('确定清理全局浏览器会话？这会重置 ChatGPT 页面的会话，并清空所有用户的上下文！')) return;
                 try {
-                    const res = await fetch('/api/new_chat', { method: 'POST' });
-                    const data = await res.json();
+                    const data = await apiFetch('/api/new_chat', { method: 'POST' });
                     if (data.status === 'success') {
                         activeSession.value.messages = [];
                         saveSessionsToLocal();
@@ -1034,7 +1216,7 @@
                         alert('重置失败: ' + data.message);
                     }
                 } catch (e) {
-                    alert('重置错误: ' + e);
+                    alert('重置错误: ' + e.message);
                 }
             };
 
@@ -1065,7 +1247,7 @@
                 scrollToBottom();
 
                 try {
-                    const res = await fetch('/api/chat', {
+                    const result = await apiFetch('/api/chat', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
@@ -1080,8 +1262,7 @@
                             }
                         })
                     });
-                    
-                    const result = await res.json();
+
                     if (result.status === 'success') {
                         const assistantMsg = {
                             role: 'assistant',
@@ -1097,11 +1278,20 @@
                         });
                     }
                 } catch (err) {
-                    activeSession.value.messages.push({
-                        role: 'assistant',
-                        text: '❌ **与服务建立连接失败**: ' + err,
-                        images: []
-                    });
+                    if (err.status === 401) {
+                        // Kicked back to the login screen by the global handler.
+                        activeSession.value.messages.push({
+                            role: 'assistant',
+                            text: '⚠️ 登录已过期，请重新登录后再发送消息。',
+                            images: []
+                        });
+                    } else {
+                        activeSession.value.messages.push({
+                            role: 'assistant',
+                            text: '❌ **与服务建立连接失败**: ' + (err.message || err),
+                            images: []
+                        });
+                    }
                 } finally {
                     loading.value = false;
                     saveSessionsToLocal();
@@ -1186,12 +1376,15 @@
             };
 
             // Lifecycle
-            onMounted(() => {
-                loadSessionsFromLocal();
-                fetchStatus();
-                setInterval(fetchStatus, 15000);
+            onMounted(async () => {
+                await fetchAuthConfig();
+                const loggedIn = await fetchMe();
                 window.addEventListener('click', handleClickAway);
                 window.addEventListener('keydown', handleKeyboardShortcuts);
+                if (loggedIn) {
+                    loadSessionsFromLocal();
+                    startStatusPolling();
+                }
             });
 
             // Clean up event listeners
@@ -1219,7 +1412,20 @@
                 toasts,
                 showToast,
                 dismissToast,
-                
+
+                // Auth state & actions
+                currentUser,
+                authMode,
+                authForm,
+                authError,
+                authLoading,
+                allowRegistration,
+                userInitial,
+                queueWaiting,
+                submitAuth,
+                switchAuthMode,
+                logout,
+
                 // Plus dropdown state & actions
                 togglePlusMenu,
                 triggerPlusAction,
