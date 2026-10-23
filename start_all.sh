@@ -30,7 +30,7 @@ venv/bin/python -m pip install -r requirements.txt
 if [ ! -f ".env" ]; then
     echo "[INFO] Creating .env from .env.example ..."
     cp .env.example .env
-    echo "[WARNING] Please edit .env (set ADMIN_PASSWORD / TELEGRAM_BOT_TOKEN) and re-run."
+    echo "[WARNING] Please edit .env (set ADMIN_PASSWORD / DINGTALK_APP_KEY / DINGTALK_APP_SECRET) and re-run."
     exit 0
 fi
 

@@ -248,8 +248,8 @@ if not st.session_state.confirm_new_chat:
 else:
     st.sidebar.warning(
         "⚠️ **确认清理？**\n\n"
-        "此操作会清除当前 ChatGPT 的对话上下文，"
-        "所有用户（包括 Telegram Bot 端）的对话都会受到影响。"
+        "此操作会清除当前 AI 平台的对话上下文，"
+        "所有用户（包括钉钉机器人端）的对话都会受到影响。"
     )
     col1, col2 = st.sidebar.columns(2)
     with col1:

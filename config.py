@@ -20,9 +20,14 @@ DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Telegram Bot
+# DingTalk robot (企业内部应用, Stream 长连接模式, 无需公网回调)
 # ---------------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# AppKey / Client ID and AppSecret / Client Secret from the DingTalk Open
+# Platform (企业内部应用 -> 机器人 -> 消息接收模式 Stream).
+DINGTALK_APP_KEY = os.getenv("DINGTALK_APP_KEY", "").strip()
+DINGTALK_APP_SECRET = os.getenv("DINGTALK_APP_SECRET", "").strip()
+# The robotCode is normally the same as the AppKey/Client ID.
+DINGTALK_ROBOT_CODE = os.getenv("DINGTALK_ROBOT_CODE", "").strip() or DINGTALK_APP_KEY
 
 # ---------------------------------------------------------------------------
 # Browser CDP
@@ -168,26 +173,28 @@ MAX_UPLOAD_FILES = _get_int("MAX_UPLOAD_FILES", 5)
 WEB_MAX_WORKERS = _get_int("WEB_MAX_WORKERS", 32)
 
 # ---------------------------------------------------------------------------
-# Telegram access control
+# DingTalk access control
 # ---------------------------------------------------------------------------
 def _parse_id_list(raw):
+    """Parse a comma/semicolon separated list of DingTalk user IDs.
+
+    DingTalk IDs are strings (staffId / unionId), so they are kept verbatim
+    instead of being cast to int.
+    """
     ids = set()
     for chunk in (raw or "").replace(";", ",").split(","):
         chunk = chunk.strip()
-        if not chunk:
-            continue
-        try:
-            ids.add(int(chunk))
-        except ValueError:
-            logging.getLogger(__name__).warning("Ignoring invalid numeric ID in config: %r", chunk)
+        if chunk:
+            ids.add(chunk)
     return ids
 
 
 # Empty whitelist = allow everyone (legacy behavior); once any IDs are listed,
-# only those Telegram users may interact with the bot.
-ALLOWED_TELEGRAM_IDS = _parse_id_list(os.getenv("ALLOWED_TELEGRAM_IDS", ""))
+# only those DingTalk users may interact with the bot. Both staffId and
+# (encrypted) unionId are accepted.
+ALLOWED_DINGTALK_IDS = _parse_id_list(os.getenv("ALLOWED_DINGTALK_IDS", ""))
 # Admin IDs may use management commands (/log etc.). Defaults to the whitelist.
-TELEGRAM_ADMIN_IDS = _parse_id_list(os.getenv("TELEGRAM_ADMIN_IDS", "")) or ALLOWED_TELEGRAM_IDS
+DINGTALK_ADMIN_IDS = _parse_id_list(os.getenv("DINGTALK_ADMIN_IDS", "")) or ALLOWED_DINGTALK_IDS
 
 # ---------------------------------------------------------------------------
 # Misc

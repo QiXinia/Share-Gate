@@ -4,13 +4,13 @@ Responsibilities
 ----------------
 1. Detect / launch a Chromium-based browser with remote debugging enabled.
 2. Start the ngrok tunnel (optional).
-3. Start the Telegram bot (optional).
+3. Start the DingTalk robot (optional, Stream long-connection mode).
 4. Start the web server (with authentication).
 5. On exit, terminate the whole process tree cleanly (no orphan processes or
    port conflicts on Windows).
 
 Runs on Windows, macOS and Linux. The browser is intentionally NOT killed on
-exit - it keeps the ChatGPT login session alive for the next run.
+exit - it keeps the ChatGPT / Gemini login sessions alive for the next run.
 """
 
 import subprocess
@@ -359,12 +359,17 @@ def main():
     else:
         print("[2/4] Ngrok is disabled in configuration.")
 
-    # 3. Telegram bot
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    is_bot_configured = bool(bot_token and bot_token != "YOUR_BOT_TOKEN_HERE")
+    # 3. DingTalk robot (optional)
+    dt_key = os.getenv("DINGTALK_APP_KEY", "").strip()
+    dt_secret = os.getenv("DINGTALK_APP_SECRET", "").strip()
+    is_bot_configured = bool(
+        dt_key and dt_secret
+        and dt_key not in ("YOUR_APP_KEY_HERE",)
+        and dt_secret not in ("YOUR_APP_SECRET_HERE",)
+    )
     bot_process = None
     if is_bot_configured:
-        print("[3/4] Starting Telegram Bot...")
+        print("[3/4] Starting DingTalk Robot...")
         try:
             bot_process = subprocess.Popen(
                 [python_exe, os.path.join(config.BASE_DIR, "bot.py")],
@@ -378,9 +383,9 @@ def main():
                 target=stream_output, args=(bot_process, "Bot"), daemon=True
             ).start()
         except Exception as e:
-            print(f"❌ Failed to start Telegram Bot: {e}")
+            print(f"❌ Failed to start DingTalk Robot: {e}")
     else:
-        print("[3/4] Telegram Bot skipped (TELEGRAM_BOT_TOKEN not set).")
+        print("[3/4] DingTalk Robot skipped (DINGTALK_APP_KEY/SECRET not set).")
 
     time.sleep(2)
 
@@ -427,7 +432,7 @@ def main():
         while not stopping:
             time.sleep(1)
             if bot_process and bot_process.poll() is not None:
-                print("⚠️ Telegram Bot process terminated unexpectedly.")
+                print("⚠️ DingTalk Robot process terminated unexpectedly.")
                 break
             if web_process and web_process.poll() is not None:
                 print("⚠️ Web Server process terminated unexpectedly.")
@@ -439,7 +444,7 @@ def main():
         request_stop()
     finally:
         # Stop the managed services; the browser is deliberately kept alive.
-        terminate_process_tree(bot_process, "Telegram Bot")
+        terminate_process_tree(bot_process, "DingTalk Robot")
         terminate_process_tree(web_process, "Web Server")
         terminate_process_tree(ngrok_process, "Ngrok")
         print("All managed processes stopped (browser left running).")

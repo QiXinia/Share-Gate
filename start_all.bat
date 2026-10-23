@@ -60,7 +60,7 @@ if not exist .env (
     echo.
     echo [WARNING] A new .env has been generated from the template.
     echo [WARNING] Please edit .env and set at least ADMIN_PASSWORD (web login)
-    echo [WARNING] and TELEGRAM_BOT_TOKEN (if you use the bot), then run again.
+    echo [WARNING] and DINGTALK_APP_KEY / DINGTALK_APP_SECRET (if you use the robot), then run again.
     echo.
     pause
     exit /b 0
