@@ -29,6 +29,14 @@ DINGTALK_APP_SECRET = os.getenv("DINGTALK_APP_SECRET", "").strip()
 # The robotCode is normally the same as the AppKey/Client ID.
 DINGTALK_ROBOT_CODE = os.getenv("DINGTALK_ROBOT_CODE", "").strip() or DINGTALK_APP_KEY
 
+# DingTalk web SSO (OAuth2 authorization-code flow). Shares the same internal
+# application credentials as the robot. The redirect URI must be registered as
+# a trusted callback on the DingTalk Open Platform.
+#   DINGTALK_OAUTH_BASE is the externally reachable base URL, e.g.
+#   https://your-ngrok-domain ; leave empty to derive it from the request Host.
+DINGTALK_OAUTH_BASE = os.getenv("DINGTALK_OAUTH_BASE", "").strip().rstrip("/")
+DINGTALK_OAUTH_PATH = "/auth/dingtalk/callback"
+
 # ---------------------------------------------------------------------------
 # Browser CDP
 # ---------------------------------------------------------------------------
@@ -137,6 +145,32 @@ WEB_PORT = _get_int("WEB_PORT", 8501)
 
 # Trust the X-Forwarded-* headers only when behind a reverse proxy / tunnel.
 TRUST_FORWARDED_HEADERS = _get_bool("TRUST_FORWARDED_HEADERS", False)
+
+# ---------------------------------------------------------------------------
+# 1:1 shared desktop (real-time browser streaming)
+# ---------------------------------------------------------------------------
+# The desktop service runs its own aiohttp server (WebSocket streaming). It
+# defaults to WEB_PORT + 1 so it can coexist with the legacy console.
+DESKTOP_PORT = _get_int("DESKTOP_PORT", WEB_PORT + 1)
+
+# Expose DingTalk SSO on the desktop login page. Defaults to enabled whenever
+# real DingTalk app credentials are present, unless explicitly disabled.
+_cred_present = bool(
+    DINGTALK_APP_KEY and DINGTALK_APP_SECRET
+    and DINGTALK_APP_KEY not in ("YOUR_APP_KEY_HERE",)
+    and DINGTALK_APP_SECRET not in ("YOUR_APP_SECRET_HERE",)
+)
+DINGTALK_SSO_ENABLED = _get_bool("DINGTALK_SSO_ENABLED", _cred_present)
+
+# Each user gets an independent browser tab + conversation on the shared
+# logged-in profile. These cap resource usage.
+DESKTOP_MAX_TABS = _get_int("DESKTOP_MAX_TABS", 12)
+DESKTOP_IDLE_CLOSE_MIN = _get_int("DESKTOP_IDLE_CLOSE_MIN", 30)
+# Screencast bounds and quality (bandwidth / smoothness trade-off).
+DESKTOP_MAX_WIDTH = _get_int("DESKTOP_MAX_WIDTH", 1280)
+DESKTOP_MAX_HEIGHT = _get_int("DESKTOP_MAX_HEIGHT", 800)
+DESKTOP_JPEG_QUALITY = _get_int("DESKTOP_JPEG_QUALITY", 60)
+DESKTOP_FPS = _get_int("DESKTOP_FPS", 8)
 
 # ---------------------------------------------------------------------------
 # Authentication / sessions

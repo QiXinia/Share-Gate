@@ -245,6 +245,72 @@ class AuthManager:
         with self._users_lock:
             return len(self._users)
 
+    def upsert_oauth_user(self, provider, provider_id, nickname=None,
+                         avatar=None, role="user"):
+        """Find or create a passwordless user that logged in via SSO.
+
+        ``provider`` is the identity provider (e.g. "dingtalk"); ``provider_id``
+        is that provider's stable unique user id (openId/unionId). A stable
+        local username is derived so it fits the USERNAME_RE character set.
+        Returns the local username.
+        """
+        provider = (provider or "oauth").lower()
+        provider_id = str(provider_id or "").strip()
+        if not provider_id:
+            raise ValueError("provider_id is required")
+        derived = "{}__{}".format(
+            provider,
+            hashlib.sha256(provider_id.encode("utf-8")).hexdigest()[:16],
+        )
+        now = time.time()
+        with self._users_lock:
+            existing = None
+            for name, info in self._users.items():
+                if info.get("provider") == provider and \
+                        info.get("provider_id") == provider_id:
+                    existing = name
+                    break
+            if existing:
+                # Refresh display metadata without touching anything else.
+                if nickname:
+                    self._users[existing]["display_name"] = nickname
+                if avatar:
+                    self._users[existing]["avatar"] = avatar
+                self._atomic_write_json(self.users_file, self._users)
+                return existing
+            # Avoid an astronomically unlikely collision.
+            username = derived
+            while username in self._users:
+                username = derived + secrets.token_hex(2)
+            self._users[username] = {
+                # A random, unguessable, non-user-facing password string means
+                # password login can never succeed for an SSO-only account.
+                "password": hash_password(secrets.token_urlsafe(24)),
+                "role": role,
+                "provider": provider,
+                "provider_id": provider_id,
+                "display_name": nickname or username,
+                "avatar": avatar or "",
+                "created_at": now,
+            }
+            self._atomic_write_json(self.users_file, self._users)
+            logger.info("Created %s SSO user '%s' (%s).", provider, username, nickname)
+            return username
+
+    def get_user_profile(self, username):
+        """Public-safe profile fields for the UI."""
+        with self._users_lock:
+            info = self._users.get(username)
+            if not info:
+                return None
+            return {
+                "username": username,
+                "role": info.get("role", "user"),
+                "provider": info.get("provider", "password"),
+                "display_name": info.get("display_name") or username,
+                "avatar": info.get("avatar", ""),
+            }
+
     # ------------------------------------------------------------------
     # Authentication
     # ------------------------------------------------------------------

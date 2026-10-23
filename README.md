@@ -53,6 +53,7 @@
 2. **免买 API 额度**：直接利用本地已登录的 Chrome 或 Edge 浏览器在网页端进行操作，免去昂贵的 API 官方 Token 费用，直接复用 Plus 账号的全部专属功能（如 DALL-E 3、GPT-4o 额度）。
 3. **多端独立交互界面**：
    - 🤖 **钉钉机器人**：亲友们随时随地通过钉钉（单聊或群聊 @机器人）与您的 ChatGPT / Gemini 聊天、作图，各人拥有完全独立的对话上下文。采用企业内部应用 **Stream 长连接**模式，无需公网回调地址。
+   - 🖥️ **1:1 共享桌面**：访客**钉钉扫码登录**后，在浏览器里直接看到并操作像素级 1:1 的真实 ChatGPT / Gemini 页面，鼠标键盘与中文输入实时回传；每个用户独立标签页、独立对话，多人互不串话。
    - 💻 **Streamlit 网页端**：管理员本地运行的精美 Web UI 控制台，支持查看浏览器状态、直接对话与快速重置。
 4. **多模态全功能支持**：
    - 💬 **文字对话**：完整的纯文本会话。
@@ -81,6 +82,11 @@
 9. **服务器性能与稳定性** ⚡：
    - 有界线程池（线程复用，避免无限新建线程）、HTTP/1.1 keep-alive 连接复用、**gzip 压缩**（页面体积约压缩 80%）、静态资源 ETag/304 与缓存头。
    - 浏览器任务**全局排队计数**，可在侧边栏实时查看排队人数；队列满载时快速返回 503，避免雪崩。
+
+10. **多租户远程浏览器与钉钉 SSO** 🖥️：
+    - 基于 CDP screencast + WebSocket 的实时画面串流，配合 `Input` 域事件回传，实现 1:1 远程操作；视口随画布自适应，坐标天然对齐。
+    - 每“用户 × 平台”独立标签页会话池（`browser_pool.py`），支持并发、空闲回收与全局标签页上限；桌面服务基于异步 `aiohttp`，与旧控制台共存、共享会话。
+    - 钉钉 OAuth2 授权码扫码登录（`dingtalk_sso.py`），以 openId 建立稳定本地账号，state 防 CSRF、WebSocket 校验同源、会话 Cookie 与旧控制台一致。
 
 ---
 
@@ -220,6 +226,54 @@ DEFAULT_PLATFORM=chatgpt
 
 ---
 
+## 🖥️ 1:1 共享桌面 + 钉钉扫码登录（多人分账号隔离）
+
+除了“命令式”的网页控制台和钉钉机器人，Share-Gate 还提供一套**像素级 1:1 还原 ChatGPT / Gemini 网页**的共享桌面：每个钉钉用户扫码登录后，在自己的浏览器里直接看到并操作一个真实的平台标签页，鼠标、键盘、中文输入、滚轮全部实时回传，多人同时使用互不串话。
+
+### 工作原理
+
+- 后端用 CDP（`Page.startScreencast`）把每个用户专属标签页的画面以 JPEG 帧通过 WebSocket 推给前端，前端再把鼠标 / 键盘 / 滚轮事件通过 CDP（`Input.dispatchMouseEvent / dispatchKeyEvent / insertText`）回传，视口与画布 1:1 对齐，坐标无需缩放。
+- **账号模型**：所有用户共享同一台机器上**同一个已登录的 Chrome 配置**（即同一个 ChatGPT Plus / Gemini 账号），但系统为每个“用户 × 平台”分配一个**独立的浏览器标签页并打开平台根地址（全新对话）**。不同标签页的对话天然隔离、可并行，互不影响。
+- 钉钉用户通过 **OAuth2 授权码流程**扫码登录，以 openId 作为稳定唯一标识自动建立本地账号；账号密码登录仍作为兜底。
+- 桌面服务独立运行在 **8502 端口**（`DESKTOP_PORT`，默认管理控制台 +1），与旧控制台（8501）共存，共享同一份用户 / 会话数据和同一个 Chrome；ngrok 隧道默认转发桌面端口。
+
+### 配置步骤
+
+1. 在钉钉开放平台你的**企业内部应用**中，进入「登录与分享 / 重定向 URL（登录回调地址）」，添加可信回调：
+   `https://<你的 ngrok 域名>/auth/dingtalk/callback`
+   （机器人 Stream 模式与网页登录共用同一个 `DINGTALK_APP_KEY / DINGTALK_APP_SECRET`。）
+2. 在 `.env` 中：
+   ```bash
+   # 已配置真实 AppKey/AppSecret 时桌面登录默认开启，也可显式开关
+   DINGTALK_SSO_ENABLED=True
+   # 外部域名（一般是 ngrok 域名）；留空则按请求域名自动推导
+   DINGTALK_OAUTH_BASE=https://your-domain.ngrok-free.app
+   ```
+   公网暴露时同时按本文“公网暴露安全清单”设置 `TRUST_FORWARDED_HEADERS=True`。
+3. 运行 `run_all` 后，打开 **`http://localhost:8502/desktop`**（公网为 `https://<域名>/desktop`），点击「钉钉扫码登录」即可。
+
+### 使用与调参
+
+- 顶部工具栏可切换 **ChatGPT / Gemini** 标签、开启「新对话」、「刷新」；切换平台会用新的 WebSocket 重连。
+- 点击画面即可操作；中文输入法在画面内直接上屏（通过隐藏输入框捕获 IME 合成文本）。
+- 标签页断开后会保留一段时间（默认 30 分钟）以便刷新续用，超时自动回收；相关参数：
+  ```bash
+  DESKTOP_PORT=8502            # 桌面服务端口
+  DESKTOP_MAX_TABS=12          # 全局最大并发标签页
+  DESKTOP_IDLE_CLOSE_MIN=30    # 空闲标签页回收时间
+  DESKTOP_MAX_WIDTH=1280       # 画面分辨率上限
+  DESKTOP_MAX_HEIGHT=800
+  DESKTOP_JPEG_QUALITY=60      # 画质（越低越省带宽）
+  DESKTOP_FPS=8                # 串流帧率
+  ```
+
+> 注意：
+> - 这是“**共享一个已登录会员账号、每人独立对话**”的模型，适合把自己的会员额度分享给信任的朋友；它**不是**为每个访客登录其本人的 ChatGPT 账号。如需每人独立会员账号，需为每人准备独立的浏览器配置（本项目当前不提供）。
+> - 实时画面的流畅度取决于服务器到访客的带宽，可通过降低分辨率 / 画质 / 帧率来适配弱网。
+> - 钉钉扫码登录与真实平台页面的真机交互，需在你自己的机器（能访问钉钉与 ChatGPT/Gemini）上联调；自动化沙箱已验证串流、输入、多用户隔离与 OAuth 流程，但无法代替真机确认。
+
+---
+
 ## 🌐 公网（ngrok / 局域网）暴露安全清单
 
 将网页通过 ngrok 或局域网开放给朋友时，请务必：
@@ -238,13 +292,17 @@ DEFAULT_PLATFORM=chatgpt
 - **`start_all.bat`** / **`start_all.sh`**：Windows / macOS·Linux 一键自检、安装、接管与运行脚本。
 - **`run_all.py`**：主 Python 编排服务，跨平台负责浏览器探测、ngrok 配置、子进程监控与进程树生命周期回收。
 - **`web_server.py`**：带登录鉴权、安全头、gzip 与线程池的 Web 服务（默认入口，取代旧的 Streamlit 运行方式）。
-- **`auth.py`**：用户认证模块（PBKDF2 密码哈希、服务端会话、登录限流、账号管理 CLI）。
+- **`desktop_server.py`**：1:1 共享桌面服务（aiohttp + WebSocket），负责钉钉 SSO 登录路由、CDP 画面串流与键鼠 / 中文输入回传（默认 8502 端口）。
+- **`browser_pool.py`**：每“用户 × 平台”独立标签页的会话池，负责并发标签页管理、空闲回收与上限保护。
+- **`dingtalk_sso.py`**：钉钉 OAuth2 授权码登录客户端（授权跳转、换取 userAccessToken、拉取 openId / 昵称）。
+- **`auth.py`**：用户认证模块（PBKDF2 密码哈希、服务端会话、登录限流、账号管理 CLI、SSO 账号接入）。
 - **`bot.py`**：钉钉机器人（企业内部应用 Stream 长连接）逻辑，含串行 FIFO 排队、白名单/管理员控制、指令响应、图片/文件接收与生成图片回传。
 - **`app_streamlit.py`**：Streamlit 本地管理员控制台（可选，已加访问密码门）。
 - **`chatgpt_browser.py`**：基于 Playwright 的多平台浏览器控制器（ChatGPT / Gemini），含 CDP 连接、标签页管理、图片下载、跨进程文件锁、队列计数与健康指标。
 - **`gemini_adapter.py`**：Google Gemini 网页驱动，负责登录检测、新建对话隔离、内容输入、发送、等待完成与回复提取（选择器集中容错）。
-- **`config.py`**：全局配置加载（含 Web、安全、白名单、上传限制、跨平台路径等）。
+- **`config.py`**：全局配置加载（含 Web、安全、白名单、上传限制、桌面串流、跨平台路径等）。
 - **`static/index.html`**：网页端控制台（Vue 3），含登录/注册页、用户菜单与会话管理。
+- **`static/desktop.html`**：1:1 共享桌面前端（实时画面渲染、键鼠 / IME 输入采集、平台切换、钉钉登录）。
 - **`static/vendor/`**：本地托管的前端库（Vue / Tailwind / Marked），无需外网 CDN 即可加载。
 - **`data/`**（运行时生成，已 gitignore）：账户、会话与服务端密钥。
 - **`.env.example`**：配置指南模板。

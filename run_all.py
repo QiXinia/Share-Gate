@@ -315,6 +315,7 @@ def main():
     print()
 
     web_port = config.WEB_PORT
+    desktop_port = config.DESKTOP_PORT
 
     # 1. Browser
     launch_browser(config.CDP_PORT)
@@ -329,17 +330,18 @@ def main():
     use_ngrok = os.getenv("USE_NGROK", "True").strip().lower() in ("true", "1", "yes")
     ngrok_process = None
     if use_ngrok:
-        print("[2/4] Starting Ngrok Tunnel...")
+        print("[2/5] Starting Ngrok Tunnel (targets the shared desktop)...")
         ngrok_bin = find_ngrok()
         if not ngrok_bin:
-            print("⚠️ [WARNING] ngrok not found. Skipping tunnel; the web UI stays local.")
-            print(f"          Local access: http://localhost:{web_port}")
+            print("⚠️ [WARNING] ngrok not found. Skipping tunnel; the desktop stays local.")
+            print(f"          Local desktop: http://localhost:{desktop_port}/desktop")
         else:
             tunnel_url = os.getenv("NGROK_TUNNEL_URL", "").strip()
             ngrok_cmd = [ngrok_bin, "http"]
             if tunnel_url:
                 ngrok_cmd.append(f"--url={tunnel_url}")
-            ngrok_cmd.extend([str(web_port), f"--host-header=localhost:{web_port}"])
+            ngrok_cmd.extend([str(desktop_port),
+                              f"--host-header=localhost:{desktop_port}"])
             try:
                 ngrok_process = subprocess.Popen(
                     ngrok_cmd,
@@ -369,7 +371,7 @@ def main():
     )
     bot_process = None
     if is_bot_configured:
-        print("[3/4] Starting DingTalk Robot...")
+        print("[3/5] Starting DingTalk Robot...")
         try:
             bot_process = subprocess.Popen(
                 [python_exe, os.path.join(config.BASE_DIR, "bot.py")],
@@ -385,12 +387,12 @@ def main():
         except Exception as e:
             print(f"❌ Failed to start DingTalk Robot: {e}")
     else:
-        print("[3/4] DingTalk Robot skipped (DINGTALK_APP_KEY/SECRET not set).")
+        print("[3/5] DingTalk Robot skipped (DINGTALK_APP_KEY/SECRET not set).")
 
     time.sleep(2)
 
     # 4. Web server
-    print("[4/4] Starting Web Server...")
+    print("[4/5] Starting Web Server...")
     web_process = None
     try:
         web_process = subprocess.Popen(
@@ -407,9 +409,30 @@ def main():
     except Exception as e:
         print(f"❌ Failed to start Web Server: {e}")
 
+    time.sleep(1)
+
+    # 5. 1:1 shared desktop (streaming + DingTalk SSO)
+    print("[5/5] Starting Shared Desktop Service...")
+    desktop_process = None
+    try:
+        desktop_process = subprocess.Popen(
+            [python_exe, os.path.join(config.BASE_DIR, "desktop_server.py")],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=config.BASE_DIR,
+            env=env,
+            **detached_popen_kwargs(),
+        )
+        threading.Thread(
+            target=stream_output, args=(desktop_process, "Desktop"), daemon=True
+        ).start()
+    except Exception as e:
+        print(f"❌ Failed to start Shared Desktop: {e}")
+
     print()
     print("============================================")
-    print(f"  Web UI:  http://localhost:{web_port}")
+    print(f"  Shared desktop (1:1): http://localhost:{desktop_port}/desktop")
+    print(f"  Admin console:        http://localhost:{web_port}")
     print("  Press Ctrl+C to terminate all services.")
     print("============================================")
     print()
@@ -437,6 +460,9 @@ def main():
             if web_process and web_process.poll() is not None:
                 print("⚠️ Web Server process terminated unexpectedly.")
                 break
+            if desktop_process and desktop_process.poll() is not None:
+                print("⚠️ Shared Desktop process terminated unexpectedly.")
+                break
             if ngrok_process and ngrok_process.poll() is not None and not ngrok_warned_dead:
                 print("⚠️ Ngrok tunnel process terminated unexpectedly.")
                 ngrok_warned_dead = True
@@ -446,6 +472,7 @@ def main():
         # Stop the managed services; the browser is deliberately kept alive.
         terminate_process_tree(bot_process, "DingTalk Robot")
         terminate_process_tree(web_process, "Web Server")
+        terminate_process_tree(desktop_process, "Shared Desktop")
         terminate_process_tree(ngrok_process, "Ngrok")
         print("All managed processes stopped (browser left running).")
 
