@@ -39,9 +39,15 @@
   .tool-btn:hover { border-color:var(--accent); }
   #user { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
   #user img { width:24px; height:24px; border-radius:50%; }
-  #stage { flex:1; position:relative; overflow:hidden; background:#0b0d12; display:flex; align-items:center; justify-content:center; }
-  #screen { background:#fff; box-shadow:0 0 0 1px var(--line); }
-  #capture { position:absolute; inset:0; width:100%; height:100%; opacity:0; resize:none;
+  #stage { flex:1; position:relative; overflow:hidden; background:#0b0d12; }
+  #screen { background:#fff; position:absolute; inset:0; width:100%; height:100%; box-shadow:0 0 0 1px var(--line); }
+  #mirror { position:absolute; inset:0; width:100%; height:100%; border:0; background:#fff;
+    display:none; box-shadow:0 0 0 1px var(--line); }
+  body.mode-dom #mirror { display:block; }
+  body.mode-dom #screen { display:none; }
+  body.mode-stream #mirror { display:none; }
+  body.mode-stream #screen { display:block; }
+  #capture { position:absolute; inset:0; width:100%; height:100%; opacity:0; resize:none; z-index:4;
     caret-color:transparent; border:0; background:transparent; color:transparent; cursor:default; outline:none; }
   #statusbar { position:absolute; top:10px; left:50%; transform:translateX(-50%); padding:6px 14px;
     border-radius:20px; background:rgba(20,23,31,.9); border:1px solid var(--line); font-size:12px;
@@ -73,12 +79,14 @@
     <div id="toolbar">
       <div class="tabs" id="tabs"></div>
       <div class="spacer"></div>
+      <button class="tool-btn" id="modeBtn" title="切换省流(DOM) / 高清(像素) 模式">省流模式</button>
       <button class="tool-btn" id="newChat">＋ 新对话</button>
       <button class="tool-btn" id="reload">⟳ 刷新</button>
       <div id="user"><span id="nick"></span><img id="avatar" alt="" style="display:none"></div>
       <button class="tool-btn" id="logoutBtn">退出</button>
     </div>
     <div id="stage">
+      <iframe id="mirror" title="shared desktop" sandbox="allow-same-origin"></iframe>
       <canvas id="screen"></canvas>
       <textarea id="capture" autocomplete="off" autocorrect="off"
         autocapitalize="off" spellcheck="false"></textarea>
@@ -88,8 +96,15 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let me = null, ws = null, platform = null;
+let me = null, ws = null, platform = null, mode = 'dom';
 const platformLabels = {};
+const RES_TOKEN = '__SG_RES__';
+
+// Replace server resource placeholders with the authenticated relay endpoint.
+function fixResources(text) {
+  return text.replace(new RegExp(RES_TOKEN.replace(/_/g, '\\_') + '([^\\s"\\\')\\\\]+)', 'g'),
+    (m, u) => `${location.origin}/resource?u=${encodeURIComponent(u)}&platform=${platform}`);
+}
 
 // ---------------- Auth ----------------
 async function loadMe() {
@@ -119,9 +134,13 @@ function showApp() {
     b.onclick = () => switchPlatform(p);
     $('tabs').appendChild(b);
   });
-  platform = list.includes(new URLSearchParams(location.search).get('platform'))
+  const initial = list.includes(new URLSearchParams(location.search).get('platform'))
     ? new URLSearchParams(location.search).get('platform') : list[0];
-  switchPlatform(platform);
+  // Pick up the server-configured default rendering mode before connecting.
+  fetch('/api/desktop-config').then(r => r.ok ? r.json() : null)
+    .then(cfg => { if (cfg && cfg.default_mode) applyMode(cfg.default_mode); })
+    .catch(() => {})
+    .finally(() => { platform = initial; switchPlatform(initial); });
 }
 async function doLogin() {
   $('loginErr').textContent = '';
@@ -139,6 +158,14 @@ $('logoutBtn').onclick = async () => {
 };
 
 // ---------------- Platform / streaming ----------------
+let mirrorCss = '';
+function applyMode(m) {
+  mode = m;
+  document.body.classList.toggle('mode-dom', m === 'dom');
+  document.body.classList.toggle('mode-stream', m === 'stream');
+  $('modeBtn').textContent = m === 'dom' ? '省流模式' : '高清模式';
+}
+applyMode(mode);
 function switchPlatform(p) {
   if (platform === p && ws && ws.readyState === 1) return;
   platform = p;
@@ -151,11 +178,31 @@ function setStatus(text, cls) {
   el.textContent = text;
   el.className = cls || '';
 }
+
+// Render a DOM mirror snapshot into a script-disabled sandboxed iframe.
+function renderDom(d) {
+  if (d.css && d.css.length) mirrorCss = d.css.map(fixResources).join('\n');
+  const parsed = new DOMParser().parseFromString(d.html || '', 'text/html');
+  const body = parsed.body || document.createElement('body');
+  const bodyInner = fixResources(body.innerHTML);
+  const cls = body.className || '';
+  const st = -(d.scrollTop || 0);
+  const srcdoc =
+    '<!doctype html><html><head><meta charset="utf-8">' +
+    '<base href="' + (d.base || '') + '">' +
+    '<style>html,body{margin:0;padding:0;}html{overflow:hidden;background:#fff;}' +
+    'body{transform:translateY(' + st + 'px);}' + mirrorCss + '</style></head>' +
+    '<body class="' + cls + '">' + bodyInner + '</body></html>';
+  $('mirror').srcdoc = srcdoc;
+}
+
 function connect(p) {
   if (ws) { try { ws.onclose = null; ws.close(); } catch(e){} ws = null; }
+  mirrorCss = '';
   setStatus('正在连接 ' + (platformLabels[p] || p) + '…');
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws?platform=${encodeURIComponent(p)}`);
+  ws = new WebSocket(
+    `${proto}://${location.host}/ws?platform=${encodeURIComponent(p)}&mode=${mode}`);
   const canvas = $('screen');
   const ctx = canvas.getContext('2d');
 
@@ -165,12 +212,21 @@ function connect(p) {
   };
   ws.onmessage = (ev) => {
     let d; try { d = JSON.parse(ev.data); } catch(e){ return; }
-    if (d.type === 'ready') { setStatus('已连接 · 点击画面即可操作', 'ok'); }
+    if (d.type === 'ready') {
+      applyMode(d.mode || mode);
+      setStatus('已连接 · 点击画面即可操作', 'ok');
+    }
+    else if (d.type === 'dom') {
+      renderDom(d);
+    }
     else if (d.type === 'frame') {
       canvas.width = d.width; canvas.height = d.height;
       const img = new Image();
       img.onload = () => { ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(img,0,0); };
       img.src = 'data:image/jpeg;base64,' + d.data;
+    }
+    else if (d.type === 'notice') {
+      setStatus(d.message || '提示', 'err');
     }
     else if (d.type === 'error') { setStatus(d.message || '串流错误', 'err'); }
     else if (d.type === 'control_result' && d.status === 'error') {
@@ -180,6 +236,12 @@ function connect(p) {
   ws.onclose = () => setStatus('连接已断开，2 秒后重连…', 'err');
   ws.onerror = () => setStatus('连接错误', 'err');
 }
+
+// Toggle between DOM (traffic-saving) and HD (pixel) modes, then reconnect.
+$('modeBtn').onclick = () => {
+  applyMode(mode === 'dom' ? 'stream' : 'dom');
+  if (platform) connect(platform);
+};
 
 // Resize (debounced)
 let resizeTimer = null;

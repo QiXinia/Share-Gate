@@ -171,6 +171,11 @@ DESKTOP_MAX_WIDTH = _get_int("DESKTOP_MAX_WIDTH", 1280)
 DESKTOP_MAX_HEIGHT = _get_int("DESKTOP_MAX_HEIGHT", 800)
 DESKTOP_JPEG_QUALITY = _get_int("DESKTOP_JPEG_QUALITY", 60)
 DESKTOP_FPS = _get_int("DESKTOP_FPS", 8)
+# Default desktop rendering mode: "dom" (traffic-saving DOM mirror) or
+# "stream" (pixel screencast). Users can toggle it in the toolbar.
+DESKTOP_DEFAULT_MODE = os.getenv("DESKTOP_DEFAULT_MODE", "dom").strip().lower()
+if DESKTOP_DEFAULT_MODE not in ("dom", "stream"):
+    DESKTOP_DEFAULT_MODE = "dom"
 
 # ---------------------------------------------------------------------------
 # Authentication / sessions

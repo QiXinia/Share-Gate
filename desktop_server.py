@@ -26,10 +26,14 @@ import mimetypes
 
 from aiohttp import web, WSMsgType
 
+from urllib.parse import urlparse
+
 import config
 from auth import AuthManager
 from browser_pool import BrowserPool, PoolOverflow
 from dingtalk_sso import DingTalkSSO, DingTalkSSOError
+from ownership import OwnershipStore
+from page_inject import build_inject_script, RESOURCE_HOST_ALLOW
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -56,6 +60,7 @@ auth_manager.ensure_admin(config.ADMIN_USERNAME, config.ADMIN_PASSWORD)
 
 sso = DingTalkSSO(config.DINGTALK_APP_KEY, config.DINGTALK_APP_SECRET)
 pool = BrowserPool()
+ownership = OwnershipStore(os.path.join(config.DATA_DIR, "ownership.json"))
 
 # CDP mouse button number -> name.
 _MOUSE_BUTTONS = {0: "left", 1: "middle", 2: "right"}
@@ -205,25 +210,136 @@ async def desktop_page(_request):
 # WebSocket streaming
 # ---------------------------------------------------------------------------
 class StreamSession:
-    def __init__(self, ws, user, platform, request):
+    def __init__(self, ws, user, platform, request, mode="dom", role="user"):
         self.ws = ws
         self.user = user
         self.platform = platform
         self.request = request
+        self.mode = mode if mode in ("dom", "stream") else "dom"
+        self.role = role
         self.cdp = None
+        self.page = None
         self.closed = False
         self.last_frame_sent = 0.0
         self.frame_interval = 1.0 / max(1, config.DESKTOP_FPS)
         self.viewport = {"width": config.DESKTOP_MAX_WIDTH,
                          "height": config.DESKTOP_MAX_HEIGHT}
 
-    async def _resize(self, width, height):
-        width = max(320, min(int(width), config.DESKTOP_MAX_WIDTH))
-        height = max(240, min(int(height), config.DESKTOP_MAX_HEIGHT))
-        self.viewport = {"width": width, "height": height}
+    # ------------------------------------------------------------------
+    # Shared setup: ownership + lockdown + DOM bindings
+    # ------------------------------------------------------------------
+    async def _setup_page(self):
+        self.page, is_new = await pool.acquire(self.user, self.platform)
+        self.cdp = await pool.new_cdp_session(self.page)
+        await self.cdp.send("Runtime.enable")
+        await self.cdp.send("Page.enable")
+        # Bindings the page script calls into.
+        for name in ("__sgPush", "__sgOwn", "__sgEvent"):
+            await self.cdp.send("Runtime.addBinding", {"name": name})
+        self.cdp.on("Runtime.bindingCalled", self._on_binding)
+        # Main-frame full navigations need the ownership set re-pushed.
+        self.cdp.on("Page.frameNavigated", self._on_frame_navigated)
+        # Inject on every future navigation ...
+        await self._inject_script()
+        # ... and once for the currently loaded document.
+        await self._evaluate_script()
+        w, h = self.viewport["width"], self.viewport["height"]
         await self.cdp.send("Emulation.setDeviceMetricsOverride", {
-            "width": width, "height": height, "deviceScaleFactor": 1,
-            "mobile": False,
+            "width": w, "height": h, "deviceScaleFactor": 1, "mobile": False})
+        return is_new
+
+    def _owned_ids(self):
+        return ownership.get(self.user, self.platform)
+
+    def _script_source(self):
+        return build_inject_script(
+            self.platform, self._owned_ids(),
+            is_admin=self.role == "admin", lock_ui=True, mode=self.mode)
+
+    def _inject_script(self):
+        return self.cdp.send("Page.addScriptToEvaluateOnNewDocument",
+                             {"source": self._script_source()})
+
+    def _evaluate_script(self):
+        return self.cdp.send("Runtime.evaluate",
+                             {"expression": self._script_source(),
+                              "runImmediately": True})
+
+    async def _sync_owned(self):
+        """After a full-document navigation, push the latest ownership set."""
+        ids = self._owned_ids()
+        try:
+            await self.cdp.send("Runtime.evaluate", {
+                "expression":
+                f"window.__sgSetOwned && window.__sgSetOwned({json.dumps(ids)})"})
+        except Exception:
+            pass
+
+    def _on_frame_navigated(self, params):
+        frame = params.get("frame", {})
+        if not frame.get("parentId"):  # main frame, full (non same-document) nav
+            asyncio.create_task(self._sync_owned())
+
+    def _on_binding(self, params):
+        if self.closed:
+            return
+        name = params.get("name")
+        raw = params.get("payload", "")
+        try:
+            data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            data = {}
+        if name == "__sgPush":
+            asyncio.create_task(self._send_dom(data))
+        elif name == "__sgOwn":
+            asyncio.create_task(self._handle_ownership(data))
+        elif name == "__sgEvent":
+            asyncio.create_task(self._handle_page_event(data))
+
+    async def _send_dom(self, data):
+        if self.mode != "dom":
+            return
+        try:
+            data["mode"] = "dom"
+            await self.ws.send_json(data)
+        except Exception:
+            self.closed = True
+
+    async def _handle_ownership(self, data):
+        conv_id = data.get("id")
+        platform = data.get("platform", self.platform)
+        if ownership.add(self.user, platform, conv_id):
+            logger.info("Attributed conversation %s/%s to %s",
+                        platform, conv_id, self.user)
+            # Push the updated set so the page can show/hide history.
+            ids = ownership.get(self.user, platform)
+            try:
+                await self.cdp.send("Runtime.evaluate", {
+                    "expression": f"window.__sgSetOwned && window.__sgSetOwned({json.dumps(ids)})"
+                })
+            except Exception:
+                pass
+
+    async def _handle_page_event(self, data):
+        if data.get("what") in ("logout", "nav"):
+            try:
+                await self.ws.send_json(
+                    {"type": "notice", "message": "已阻止登出/跳转账号页面"})
+            except Exception:
+                pass
+
+    async def _start_dom(self):
+        await self.cdp.send("Runtime.evaluate",
+                            {"expression": "window.__sgMirrorStart && window.__sgMirrorStart()"})
+
+    async def _start_stream(self):
+        self.cdp.on("Page.screencastFrame", self._on_frame)
+        await self.cdp.send("Page.startScreencast", {
+            "format": "jpeg",
+            "quality": config.DESKTOP_JPEG_QUALITY,
+            "maxWidth": config.DESKTOP_MAX_WIDTH,
+            "maxHeight": config.DESKTOP_MAX_HEIGHT,
+            "everyNthFrame": 1,
         })
 
     def _on_frame(self, params):
@@ -309,24 +425,28 @@ class StreamSession:
             await self.ws.send_json({"type": "control_result", "action": action,
                                      **result})
 
+    async def _resize(self, width, height):
+        width = max(320, min(int(width), config.DESKTOP_MAX_WIDTH))
+        height = max(240, min(int(height), config.DESKTOP_MAX_HEIGHT))
+        self.viewport = {"width": width, "height": height}
+        await self.cdp.send("Emulation.setDeviceMetricsOverride", {
+            "width": width, "height": height, "deviceScaleFactor": 1,
+            "mobile": False,
+        })
+        if self.mode == "dom":
+            await self.cdp.send(
+                "Runtime.evaluate",
+                {"expression": "window.__sgMirrorRequestFrame && window.__sgMirrorRequestFrame()"})
+
     async def run(self):
-        page, is_new = await pool.acquire(self.user, self.platform)
+        is_new = await self._setup_page()
         try:
-            self.cdp = await pool.new_cdp_session(page)
-            self.cdp.on("Page.screencastFrame", self._on_frame)
-            await self.cdp.send("Page.enable")
-            w, h = self.viewport["width"], self.viewport["height"]
-            await self.cdp.send("Emulation.setDeviceMetricsOverride", {
-                "width": w, "height": h, "deviceScaleFactor": 1, "mobile": False})
-            await self.cdp.send("Page.startScreencast", {
-                "format": "jpeg",
-                "quality": config.DESKTOP_JPEG_QUALITY,
-                "maxWidth": config.DESKTOP_MAX_WIDTH,
-                "maxHeight": config.DESKTOP_MAX_HEIGHT,
-                "everyNthFrame": 1,
-            })
+            if self.mode == "dom":
+                await self._start_dom()
+            else:
+                await self._start_stream()
             await self.ws.send_json({"type": "ready", "platform": self.platform,
-                                     "new_tab": is_new})
+                                     "mode": self.mode, "new_tab": is_new})
 
             async for msg in self.ws:
                 if msg.type != WSMsgType.TEXT:
@@ -338,7 +458,8 @@ class StreamSession:
                 mtype = d.get("type")
                 try:
                     if mtype in ("hello", "resize"):
-                        await self._resize(d.get("width", w), d.get("height", h))
+                        await self._resize(d.get("width", self.viewport["width"]),
+                                           d.get("height", self.viewport["height"]))
                     elif mtype == "input":
                         await pool.touch(self.user, self.platform)
                         await self._input(d)
@@ -350,10 +471,11 @@ class StreamSession:
         finally:
             self.closed = True
             if self.cdp:
-                try:
-                    await self.cdp.send("Page.stopScreencast")
-                except Exception:
-                    pass
+                if self.mode == "stream":
+                    try:
+                        await self.cdp.send("Page.stopScreencast")
+                    except Exception:
+                        pass
                 try:
                     await self.cdp.detach()
                 except Exception:
@@ -378,10 +500,14 @@ async def ws_handler(request):
     platform = request.query.get("platform", config.DEFAULT_PLATFORM)
     if platform not in config.AI_PLATFORMS:
         platform = config.DEFAULT_PLATFORM
+    mode = request.query.get("mode", "dom").lower()
+    if mode not in ("dom", "stream"):
+        mode = "dom"
 
-    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=4 * 1024 * 1024)
+    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=8 * 1024 * 1024)
     await ws.prepare(request)
-    session = StreamSession(ws, user["username"], platform, request)
+    session = StreamSession(ws, user["username"], platform, request,
+                            mode=mode, role=user.get("role", "user"))
     try:
         await session.run()
     except PoolOverflow as e:
@@ -400,11 +526,49 @@ async def ws_handler(request):
     return ws
 
 
+async def desktop_config(request):
+    return web.json_response({"default_mode": config.DESKTOP_DEFAULT_MODE})
+
+
 async def pool_status(request):
     user = current_user(request)
     if not user or user.get("role") != "admin":
         return web.json_response({"detail": "需要管理员"}, status=403)
     return web.json_response(await pool.status())
+
+
+async def resource(request):
+    """Relay a binary/asset request (image/css/font) using the shared browser's
+    cookies. Only platform main/static hosts are allowed (SSRF guard). This is
+    NOT a page reverse proxy: it serves only sub-resources referenced by the
+    DOM mirror; the page itself never runs on the client.
+    """
+    user = current_user(request)
+    if not user:
+        return web.json_response({"detail": "未登录"}, status=401)
+    url = request.query.get("u", "")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return web.json_response({"detail": "非法资源地址"}, status=400)
+    host = parsed.hostname.lower()
+    if not any(host == d or host.endswith("." + d) for d in RESOURCE_HOST_ALLOW):
+        logger.warning("Blocked resource host: %s", host)
+        return web.json_response({"detail": "资源域名不被允许"}, status=403)
+    try:
+        await pool._ensure()
+        resp = await pool.context.request.get(
+            url, timeout=30000,
+            headers={"Referer": config.PLATFORMS.get(
+                request.query.get("platform", "chatgpt"),
+                {"home_url": "https://chatgpt.com"})["home_url"]})
+        body = await resp.body()
+        ctype = resp.headers.get("content-type", "application/octet-stream")
+        return web.Response(
+            body=body, status=resp.status, content_type=ctype,
+            headers={"Cache-Control": "private, max-age=3600"})
+    except Exception as e:
+        logger.warning("Resource relay failed for %s: %s", url, e)
+        return web.json_response({"detail": "资源获取失败"}, status=502)
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +614,8 @@ def build_app():
     app.router.add_get("/auth/dingtalk/callback", dingtalk_callback)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/api/pool", pool_status)
+    app.router.add_get("/api/desktop-config", desktop_config)
+    app.router.add_get("/resource", resource)
     app.router.add_static("/static", STATIC_ROOT, name="static")
     return app
 
