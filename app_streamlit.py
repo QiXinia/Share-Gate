@@ -175,6 +175,40 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# ---------------------------------------------------------------------------
+# Access gate: the standalone Streamlit console is a local admin tool and must
+# not be open to anyone reaching the port. Unlock with STREAMLIT_PASSWORD /
+# ADMIN_PASSWORD from .env.
+# ---------------------------------------------------------------------------
+def _show_login_gate():
+    if st.session_state.get("streamlit_authed"):
+        return True
+    if not config.STREAMLIT_PASSWORD:
+        st.error(
+            "未配置访问密码。请在 .env 中设置 ADMIN_PASSWORD（或 "
+            "STREAMLIT_PASSWORD）后重启本服务。"
+        )
+        st.stop()
+        return False
+
+    st.markdown("#### 🔒 控制台访问验证")
+    st.caption("这是本地管理员控制台，请输入访问密码。")
+    with st.form("streamlit_login_form", clear_on_submit=True):
+        password = st.text_input("访问密码", type="password", placeholder="请输入密码")
+        submitted = st.form_submit_button("登录")
+    if submitted:
+        import hmac as _hmac
+        if _hmac.compare_digest(password, config.STREAMLIT_PASSWORD):
+            st.session_state.streamlit_authed = True
+            st.rerun()
+        else:
+            st.error("密码错误，请重试。")
+    st.stop()
+    return False
+
+
+_show_login_gate()
+
 # 2. Setup/retrieve browser runner singleton
 runner = get_browser_runner()
 
@@ -214,8 +248,8 @@ if not st.session_state.confirm_new_chat:
 else:
     st.sidebar.warning(
         "⚠️ **确认清理？**\n\n"
-        "此操作会清除当前 ChatGPT 的对话上下文，"
-        "所有用户（包括 Telegram Bot 端）的对话都会受到影响。"
+        "此操作会清除当前 AI 平台的对话上下文，"
+        "所有用户（包括钉钉机器人端）的对话都会受到影响。"
     )
     col1, col2 = st.sidebar.columns(2)
     with col1:

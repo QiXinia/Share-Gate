@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Share-Gate · 共享桌面</title>
+<style>
+  :root { --bg:#0f1117; --panel:#171a23; --line:#262b38; --accent:#10a37f; --text:#e7e9ee; --muted:#9aa0ad; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  /* ---------- Login ---------- */
+  #login { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  .card { width:360px; background:var(--panel); border:1px solid var(--line);
+    border-radius:16px; padding:28px; }
+  .card h1 { font-size:20px; margin:0 0 4px; }
+  .card p.sub { color:var(--muted); font-size:13px; margin:0 0 22px; }
+  .field { margin-bottom:12px; }
+  .field input { width:100%; padding:11px 12px; border-radius:10px; border:1px solid var(--line);
+    background:#0f1218; color:var(--text); font-size:14px; outline:none; }
+  .field input:focus { border-color:var(--accent); }
+  .btn { width:100%; padding:11px; border:0; border-radius:10px; font-size:14px; font-weight:600;
+    cursor:pointer; background:var(--accent); color:#fff; }
+  .btn.secondary { background:#2a2f3d; color:var(--text); margin-top:10px; }
+  .btn.dingtalk { background:#1677ff; display:flex; align-items:center; gap:8px; justify-content:center; }
+  .divider { text-align:center; color:var(--muted); font-size:12px; margin:16px 0; }
+  .err { color:#ff6b6b; font-size:13px; min-height:18px; margin-bottom:6px; }
+  /* ---------- App ---------- */
+  #app { display:none; flex-direction:column; height:100%; }
+  #toolbar { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--panel);
+    border-bottom:1px solid var(--line); }
+  .tabs { display:flex; gap:6px; }
+  .tab { padding:6px 14px; border-radius:8px; border:1px solid var(--line); background:transparent;
+    color:var(--muted); cursor:pointer; font-size:13px; }
+  .tab.active { color:#fff; background:var(--accent); border-color:var(--accent); }
+  .spacer { flex:1; }
+  .tool-btn { padding:6px 12px; border-radius:8px; border:1px solid var(--line); background:#222736;
+    color:var(--text); cursor:pointer; font-size:13px; }
+  .tool-btn:hover { border-color:var(--accent); }
+  #user { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
+  #user img { width:24px; height:24px; border-radius:50%; }
+  #stage { flex:1; position:relative; overflow:hidden; background:#0b0d12; }
+  #screen { background:#fff; position:absolute; inset:0; width:100%; height:100%; box-shadow:0 0 0 1px var(--line); }
+  #mirror { position:absolute; inset:0; width:100%; height:100%; border:0; background:#fff;
+    display:none; box-shadow:0 0 0 1px var(--line); }
+  body.mode-dom #mirror { display:block; }
+  body.mode-dom #screen { display:none; }
+  body.mode-stream #mirror { display:none; }
+  body.mode-stream #screen { display:block; }
+  #capture { position:absolute; inset:0; width:100%; height:100%; opacity:0; resize:none; z-index:4;
+    caret-color:transparent; border:0; background:transparent; color:transparent; cursor:default; outline:none; }
+  #statusbar { position:absolute; top:10px; left:50%; transform:translateX(-50%); padding:6px 14px;
+    border-radius:20px; background:rgba(20,23,31,.9); border:1px solid var(--line); font-size:12px;
+    color:var(--muted); z-index:5; }
+  #statusbar.ok { color:#5fe0b0; }
+  #statusbar.err { color:#ff8585; }
+</style>
+</head>
+<body>
+  <!-- Login -->
+  <div id="login">
+    <div class="card">
+      <h1>Share-Gate 共享桌面</h1>
+      <p class="sub">登录后使用 1:1 的 ChatGPT / Gemini 网页，每个用户独立对话。</p>
+      <div class="err" id="loginErr"></div>
+      <a id="dtBtn" class="btn dingtalk" href="/auth/dingtalk/login">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M12 2C6.5 2 2 6 2 11c0 2.7 1.4 5.1 3.6 6.7l-.9 3.3 3.6-1.9c.9.2 1.8.4 2.7.4h.4A8.5 8.5 0 0 1 11 17c0-4.5 4.3-8.1 9.6-8.1h.4C19.9 5 16.3 2 12 2z"/><path d="M22 17c0-3.3-3.2-6-7.1-6S7.8 13.7 7.8 17s3.2 6 7.1 6c.8 0 1.6-.1 2.3-.4l2.5 1.3-.6-2.2C21 20.3 22 18.7 22 17z"/></svg>
+        钉钉扫码登录
+      </a>
+      <div class="divider">或使用账号密码</div>
+      <div class="field"><input id="u" placeholder="用户名" autocomplete="username"></div>
+      <div class="field"><input id="p" type="password" placeholder="密码" autocomplete="current-password"></div>
+      <button class="btn" id="loginBtn">登录</button>
+    </div>
+  </div>
+
+  <!-- App -->
+  <div id="app">
+    <div id="toolbar">
+      <div class="tabs" id="tabs"></div>
+      <div class="spacer"></div>
+      <button class="tool-btn" id="modeBtn" title="切换省流(DOM) / 高清(像素) 模式">省流模式</button>
+      <button class="tool-btn" id="newChat">＋ 新对话</button>
+      <button class="tool-btn" id="reload">⟳ 刷新</button>
+      <div id="user"><span id="nick"></span><img id="avatar" alt="" style="display:none"></div>
+      <button class="tool-btn" id="logoutBtn">退出</button>
+    </div>
+    <div id="stage">
+      <iframe id="mirror" title="shared desktop" sandbox="allow-same-origin"></iframe>
+      <canvas id="screen"></canvas>
+      <textarea id="capture" autocomplete="off" autocorrect="off"
+        autocapitalize="off" spellcheck="false"></textarea>
+      <div id="statusbar">正在连接…</div>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let me = null, ws = null, platform = null, mode = 'dom';
+const platformLabels = {};
+const RES_TOKEN = '__SG_RES__';
+
+// Replace server resource placeholders with the authenticated relay endpoint.
+function fixResources(text) {
+  return text.replace(new RegExp(RES_TOKEN.replace(/_/g, '\\_') + '([^\\s"\\\')\\\\]+)', 'g'),
+    (m, u) => `${location.origin}/resource?u=${encodeURIComponent(u)}&platform=${platform}`);
+}
+
+// ---------------- Auth ----------------
+async function loadMe() {
+  const r = await fetch('/auth/me').catch(() => null);
+  if (r && r.ok) { me = await r.json(); return true; }
+  return false;
+}
+function showLogin() {
+  $('login').style.display = 'flex';
+  $('app').style.display = 'none';
+  if (new URLSearchParams(location.search).get('login_error'))
+    $('loginErr').textContent = '钉钉登录失败或被取消，请重试';
+}
+function showApp() {
+  $('login').style.display = 'none';
+  $('app').style.display = 'flex';
+  $('nick').textContent = me.display_name || me.username;
+  if (me.avatar) { $('avatar').src = me.avatar; $('avatar').style.display='block'; }
+  Object.assign(platformLabels, me.platform_labels || {});
+  // platform tabs
+  const list = me.platforms && me.platforms.length ? me.platforms : ['chatgpt'];
+  $('tabs').innerHTML = '';
+  list.forEach((p) => {
+    const b = document.createElement('button');
+    b.className = 'tab'; b.dataset.platform = p;
+    b.textContent = platformLabels[p] || p;
+    b.onclick = () => switchPlatform(p);
+    $('tabs').appendChild(b);
+  });
+  const initial = list.includes(new URLSearchParams(location.search).get('platform'))
+    ? new URLSearchParams(location.search).get('platform') : list[0];
+  // Pick up the server-configured default rendering mode before connecting.
+  fetch('/api/desktop-config').then(r => r.ok ? r.json() : null)
+    .then(cfg => { if (cfg && cfg.default_mode) applyMode(cfg.default_mode); })
+    .catch(() => {})
+    .finally(() => { platform = initial; switchPlatform(initial); });
+}
+async function doLogin() {
+  $('loginErr').textContent = '';
+  const r = await fetch('/auth/login', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ username: $('u').value.trim(), password: $('p').value })
+  });
+  if (r.ok) { location.reload(); }
+  else { const j = await r.json().catch(()=>({})); $('loginErr').textContent = j.detail || '登录失败'; }
+}
+$('loginBtn').onclick = doLogin;
+$('p').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+$('logoutBtn').onclick = async () => {
+  await fetch('/auth/logout', { method:'POST' }); location.reload();
+};
+
+// ---------------- Platform / streaming ----------------
+let mirrorCss = '';
+function applyMode(m) {
+  mode = m;
+  document.body.classList.toggle('mode-dom', m === 'dom');
+  document.body.classList.toggle('mode-stream', m === 'stream');
+  $('modeBtn').textContent = m === 'dom' ? '省流模式' : '高清模式';
+}
+applyMode(mode);
+function switchPlatform(p) {
+  if (platform === p && ws && ws.readyState === 1) return;
+  platform = p;
+  document.querySelectorAll('.tab').forEach((t) =>
+    t.classList.toggle('active', t.dataset.platform === p));
+  connect(p);
+}
+function setStatus(text, cls) {
+  const el = $('statusbar');
+  el.textContent = text;
+  el.className = cls || '';
+}
+
+// Render a DOM mirror snapshot into a script-disabled sandboxed iframe.
+function renderDom(d) {
+  if (d.css && d.css.length) mirrorCss = d.css.map(fixResources).join('\n');
+  const parsed = new DOMParser().parseFromString(d.html || '', 'text/html');
+  const body = parsed.body || document.createElement('body');
+  const bodyInner = fixResources(body.innerHTML);
+  const cls = body.className || '';
+  const st = -(d.scrollTop || 0);
+  const srcdoc =
+    '<!doctype html><html><head><meta charset="utf-8">' +
+    '<base href="' + (d.base || '') + '">' +
+    '<style>html,body{margin:0;padding:0;}html{overflow:hidden;background:#fff;}' +
+    'body{transform:translateY(' + st + 'px);}' + mirrorCss + '</style></head>' +
+    '<body class="' + cls + '">' + bodyInner + '</body></html>';
+  $('mirror').srcdoc = srcdoc;
+}
+
+function connect(p) {
+  if (ws) { try { ws.onclose = null; ws.close(); } catch(e){} ws = null; }
+  mirrorCss = '';
+  setStatus('正在连接 ' + (platformLabels[p] || p) + '…');
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(
+    `${proto}://${location.host}/ws?platform=${encodeURIComponent(p)}&mode=${mode}`);
+  const canvas = $('screen');
+  const ctx = canvas.getContext('2d');
+
+  ws.onopen = () => {
+    const stage = $('stage');
+    ws.send(JSON.stringify({ type:'hello', width:stage.clientWidth, height:stage.clientHeight }));
+  };
+  ws.onmessage = (ev) => {
+    let d; try { d = JSON.parse(ev.data); } catch(e){ return; }
+    if (d.type === 'ready') {
+      applyMode(d.mode || mode);
+      setStatus('已连接 · 点击画面即可操作', 'ok');
+    }
+    else if (d.type === 'dom') {
+      renderDom(d);
+    }
+    else if (d.type === 'frame') {
+      canvas.width = d.width; canvas.height = d.height;
+      const img = new Image();
+      img.onload = () => { ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(img,0,0); };
+      img.src = 'data:image/jpeg;base64,' + d.data;
+    }
+    else if (d.type === 'notice') {
+      setStatus(d.message || '提示', 'err');
+    }
+    else if (d.type === 'error') { setStatus(d.message || '串流错误', 'err'); }
+    else if (d.type === 'control_result' && d.status === 'error') {
+      setStatus(d.message || '操作失败', 'err');
+    }
+  };
+  ws.onclose = () => setStatus('连接已断开，2 秒后重连…', 'err');
+  ws.onerror = () => setStatus('连接错误', 'err');
+}
+
+// Toggle between DOM (traffic-saving) and HD (pixel) modes, then reconnect.
+$('modeBtn').onclick = () => {
+  applyMode(mode === 'dom' ? 'stream' : 'dom');
+  if (platform) connect(platform);
+};
+
+// Resize (debounced)
+let resizeTimer = null;
+new ResizeObserver(() => {
+  if (!ws || ws.readyState !== 1) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    const stage = $('stage');
+    ws.send(JSON.stringify({ type:'resize', width:stage.clientWidth, height:stage.clientHeight }));
+  }, 300);
+}).observe($('stage'));
+
+// Toolbar
+$('newChat').onclick = () => ws && ws.readyState === 1 &&
+  ws.send(JSON.stringify({ type:'control', action:'new_chat' }));
+$('reload').onclick = () => ws && ws.readyState === 1 &&
+  ws.send(JSON.stringify({ type:'control', action:'reload' }));
+
+// ---------------- Input capture ----------------
+const cap = $('capture');
+const stage = $('stage');
+function point(e) {
+  const r = stage.getBoundingClientRect();
+  return { x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top) };
+}
+function modifiers(e) {
+  return (e.altKey?1:0) | (e.ctrlKey?2:0) | (e.metaKey?4:0) | (e.shiftKey?8:0);
+}
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+stage.addEventListener('mousedown', (e) => {
+  cap.focus();
+  const {x,y} = point(e);
+  send({ type:'input', subtype:'mouseDown', x, y, button:e.button, buttons:e.buttons,
+         clickCount:e.detail || 1, modifiers:modifiers(e) });
+});
+stage.addEventListener('mousemove', (e) => {
+  const {x,y} = point(e);
+  send({ type:'input', subtype:'mouseMove', x, y, buttons:e.buttons, modifiers:modifiers(e) });
+});
+window.addEventListener('mouseup', (e) => {
+  if (!ws || ws.readyState !== 1) return;
+  const r = stage.getBoundingClientRect();
+  const x = Math.round(e.clientX - r.left), y = Math.round(e.clientY - r.top);
+  send({ type:'input', subtype:'mouseUp', x, y, button:e.button, buttons:e.buttons,
+         modifiers:modifiers(e) });
+});
+stage.addEventListener('contextmenu', (e) => e.preventDefault());
+stage.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const {x,y} = point(e);
+  let dx = e.deltaX, dy = e.deltaY;
+  if (e.deltaMode === 1) { dx *= 33; dy *= 33; }
+  else if (e.deltaMode === 2) { dx *= stage.clientWidth; dy *= stage.clientHeight; }
+  send({ type:'input', subtype:'mouseWheel', x, y, deltaX:dx, deltaY:dy,
+         modifiers:modifiers(e) });
+}, { passive:false });
+
+// Keys that must be forwarded as key events (not text).
+const SPECIAL = new Set(['Enter','Backspace','Tab','Delete','Escape','ArrowLeft','ArrowRight',
+  'ArrowUp','ArrowDown','Home','End','PageUp','PageDown','F1','F2','F3','F4','F5','F6','F7',
+  'F8','F9','F10','F11','F12','Insert']);
+cap.addEventListener('keydown', (e) => {
+  if (!ws || ws.readyState !== 1) return;
+  const mods = modifiers(e);
+  if (e.isComposing) return;
+  const combo = e.ctrlKey || e.metaKey || e.altKey;
+  if (combo) {
+    // Forward shortcuts (Ctrl+C/V/A, etc.) as raw keys.
+    e.preventDefault();
+    send({ type:'input', subtype:'keyDown', key:e.key, code:e.code, vk:e.keyCode, modifiers:mods });
+    return;
+  }
+  if (SPECIAL.has(e.key)) {
+    e.preventDefault();
+    send({ type:'input', subtype:'keyDown', key:e.key, code:e.code, vk:e.keyCode, modifiers:mods });
+    cap.value = '';
+  } else if (e.key.length === 1) {
+    e.preventDefault();
+    send({ type:'input', subtype:'insertText', text:e.key });
+  }
+});
+cap.addEventListener('keyup', (e) => {
+  if (!ws || ws.readyState !== 1) return;
+  const combo = e.ctrlKey || e.metaKey || e.altKey;
+  if (combo || SPECIAL.has(e.key)) {
+    send({ type:'input', subtype:'keyUp', key:e.key, code:e.code, vk:e.keyCode,
+           modifiers:modifiers(e) });
+  }
+  cap.value = '';
+});
+cap.addEventListener('compositionend', (e) => {
+  if (e.data) send({ type:'input', subtype:'insertText', text:e.data });
+  cap.value = '';
+});
+cap.addEventListener('input', () => { cap.value = ''; });
+// Keep focus on the capture layer.
+stage.addEventListener('click', () => cap.focus());
+
+// ---------------- Boot ----------------
+(async function boot() {
+  if (await loadMe()) showApp();
+  else {
+    showLogin();
+    if (!(await fetch('/auth/me').then(r=>r.ok).catch(()=>false))) {
+      // hide dingtalk button when SSO disabled is unknown; refresh me to learn
+      fetch('/auth/me').then(r=>r.json()).then((j) => {
+        if (j.sso_enabled === false) $('dtBtn').style.display = 'none';
+      }).catch(()=>{});
+    }
+  }
+})();
+</script>
+</body>
+</html>
