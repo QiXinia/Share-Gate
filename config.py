@@ -59,7 +59,7 @@ except Exception:
     CDP_HOST = "127.0.0.1"
 
 # ---------------------------------------------------------------------------
-# AI platforms (ChatGPT / Google Gemini)
+# AI platforms (ChatGPT / Google Gemini / Kimi)
 # ---------------------------------------------------------------------------
 # Static metadata for every supported provider. The host fragments are used to
 # match already-open tabs in the connected browser.
@@ -77,6 +77,14 @@ PLATFORMS = {
         "new_chat_url": "https://gemini.google.com/app",
         "host_fragments": ["gemini.google.com"],
         "login_url_fragments": ["accounts.google.com", "accounts.youtube.com"],
+    },
+    "kimi": {
+        # Moonshot AI Kimi web. Conversation history lives at /chat/<uuid>.
+        "label": "Kimi",
+        "home_url": "https://www.kimi.com",
+        "new_chat_url": "https://www.kimi.com",
+        "host_fragments": ["kimi.com"],
+        "login_url_fragments": ["kimi.com/login", "/login"],
     },
 }
 

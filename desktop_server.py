@@ -80,6 +80,7 @@ RC_STATE = "ext:ps-control-state"
 STATIC_ASSET_HOSTS = (
     "oaistatic.com", "oaiusercontent.com",
     "gstatic.com", "googleusercontent.com",
+    "kimi-img.moonshot.cn",   # Kimi image / uploaded-file CDN
 )
 _ASSET_URL_RE = re.compile(
     r"https://[A-Za-z0-9._-]*?(?:"

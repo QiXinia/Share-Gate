@@ -29,13 +29,17 @@ import json
 _LOGOUT_RE = r"log\s*out|sign\s*out|登\s*出|退出登录|注销"
 _SETTINGS_RE = r"^\s*settings\s*$|^\s*设置\s*$"
 _ACCOUNT_RE = (r"my\s*plan|manage\s*subscription|upgrade|switch\s*(account|workspace)|"
-               r"套餐|升级|订阅|切换(账号|组织|工作区)|账号设置|管理账户")
+               r"套餐|升级|订阅|会员|开通|充值|续费|切换(账号|组织|工作区)|账号设置|管理账户")
 
 # Hosts allowed through the resource relay (main + static/asset hosts).
 RESOURCE_HOST_ALLOW = [
     "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "openai.com",
     "gemini.google.com", "google.com", "gstatic.com", "googleusercontent.com",
     "googleapis.com", "accounts.google.com",
+    # Kimi (Moonshot AI): main site (same-origin _next/static assets) and the
+    # image/file CDN. api.moonshot.cn is intentionally NOT allowed (not a
+    # renderable sub-resource).
+    "kimi.com", "kimi-img.moonshot.cn",
 ]
 
 JS = r"""
@@ -62,6 +66,8 @@ JS = r"""
   // -------------------------------------------------------------------------
   var idRe = platform === 'gemini'
       ? /\/app\/([0-9A-Za-z_\-]+)/
+      : platform === 'kimi'
+      ? /\/chat\/([0-9A-Za-z_\-]+)/
       : /\/c\/([0-9A-Za-z_\-]+)/;
   function idFromHref(h){
     if(!h) return null;
@@ -81,7 +87,9 @@ JS = r"""
   }
 
   function historyAnchorSelector(){
-    return platform === 'gemini' ? 'a[href*="/app/"]' : 'a[href^="/c/"]';
+    if (platform === 'gemini') return 'a[href*="/app/"]';
+    if (platform === 'kimi') return 'a[href*="/chat/"]';
+    return 'a[href^="/c/"]';
   }
   function hideForeignHistory(root){
     if(isAdmin) return;

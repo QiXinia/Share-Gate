@@ -286,6 +286,13 @@ class ChatGPTBrowser:
                     )
                 except GeminiLoginRequired as e:
                     return {"status": "error", "message": str(e)}
+            if platform not in ("chatgpt", "gemini"):
+                # Providers (e.g. Kimi) wired into the 1:1 shared desktop but
+                # without a command-style driver yet: never fall through to the
+                # ChatGPT selectors. Direct users to the DOM-mirror desktop.
+                label = config.PLATFORMS[platform]["label"]
+                return {"status": "error",
+                        "message": f"{label} 暂仅支持 1:1 共享桌面（DOM 镜像），请在桌面端直接对话；命令式自动收发尚未适配。"}
             # ChatGPT path: point self.page at the ChatGPT tab and reuse logic.
             self.page = page
             return await self._do_send_message(prompt, image_path, file_paths, features, timeout_minutes)
@@ -665,6 +672,10 @@ class ChatGPTBrowser:
                     page = await self._ensure_page(platform)
                     if platform == "gemini":
                         return await self._gemini.new_chat(page)
+                    if platform not in ("chatgpt", "gemini"):
+                        label = config.PLATFORMS[platform]["label"]
+                        return {"status": "error",
+                                "message": f"{label} 请在 1:1 共享桌面点击「新对话」按钮，命令式新建会话尚未适配。"}
                     self.page = page
                     return await self._do_new_chat()
                 finally:
