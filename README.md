@@ -84,7 +84,7 @@
    - 浏览器任务**全局排队计数**，可在侧边栏实时查看排队人数；队列满载时快速返回 503，避免雪崩。
 
 10. **多租户远程浏览器与钉钉 SSO** 🖥️：
-    - 双模式渲染：默认 **CDP DOM 镜像**（克隆 DOM+CSS 到禁用脚本的沙箱 iframe，仅变化时推送，省流）；可一键回退 **CDP screencast 逐帧 JPEG**（高清像素）。两者都配合 `Input` 域事件回传，视口随画布自适应，坐标天然对齐。
+    - 双模式渲染：默认 **DOM 镜像（基于 [PhantomStream](https://github.com/fullselfbrowsing/PhantomStream)，MIT）**——服务器标签页只在开始时推一份**内联样式的完整快照**，之后仅通过 `MutationObserver` 推送**增量 DOM diff**（节点身份用稳定 node-id sidecar 维护，不再每次重发整页），前端在禁用脚本的沙箱 iframe 里原样重建，弱网下流量极小；可一键回退 **CDP screencast 逐帧 JPEG**（高清像素）。两者都配合坐标化的远程控制回传（点击/滚轮/键盘/中文输入），视口随画布自适应。
     - 每“用户 × 平台”独立标签页会话池（`browser_pool.py`），支持并发、空闲回收与全局标签页上限；桌面服务基于异步 `aiohttp`，与旧控制台共存、共享会话。
     - **按人会话隔离**：`ownership.py` 记录每用户实际打开的对话 id，注入脚本（`page_inject.py`）隐藏他人历史、登出与账号/套餐/设置入口并守卫跳转，他人会话不进入下发快照；管理员可见全部。
     - **资源中继** `/resource`：仅在平台域名白名单内、带共享浏览器登录态取回图片/字体/样式，含登录校验与 SSRF 防护；不转发页面/API，非反代。
@@ -236,12 +236,14 @@ DEFAULT_PLATFORM=chatgpt
 
 后端提供**两种渲染模式**，可在工具栏一键切换：
 
-- **省流 DOM 镜像（默认）**：服务器上的真实标签页照常登录并运行平台 JS，注入脚本通过 CDP 把页面 **DOM 结构 + CSS** 克隆后（仅在内容变化时、约 130ms 节流）推送到前端；前端用一个**禁用脚本的沙箱 iframe（`sandbox="allow-same-origin"`，不含 `allow-scripts`）**渲染。传输的是结构化文本而非逐帧 JPEG，弱网下流量显著下降；图片 / 字体等二进制资源经带登录态的 `/resource` 端点按需加载（带浏览器侧缓存）。
+- **省流 DOM 镜像（默认）**：服务器上的真实标签页照常登录并运行平台 JS，通过 CDP 注入 PhantomStream capture 脚本：开始时采集一份**内联计算样式的完整 DOM 快照**（外加一份按文档顺序排列的稳定 node-id sidecar），随后只在 DOM 发生变化时由 `MutationObserver` 产出**增量 diff**（add / remove / attr / text / value 等操作，仅携带变化的节点），经 WebSocket 推给前端；前端 PhantomStream viewer 用一个**禁用脚本的沙箱 iframe（`sandbox="allow-same-origin"`，不含 `allow-scripts`）**依据 node-id 原地打补丁，首屏之后不再重发整页（实测增量帧通常仅数百字节，远小于首屏快照）。图片 / 字体等二进制资源经带登录态的 `/resource` 端点按需加载（带浏览器侧缓存）。
 - **高清像素（回退）**：经典 CDP `Page.startScreencast` 逐帧 JPEG 串流（`Input.dispatchMouseEvent / dispatchKeyEvent / insertText` 回传），保真度最高，适合带宽充足、需要看到 canvas / 复杂动画时使用。
 
-两种模式下鼠标 / 键盘 / 滚轮 / 中文输入的回传链路完全一致，视口与画布 1:1 对齐、坐标无需缩放。
+两种模式下鼠标 / 键盘 / 滚轮 / 中文输入均通过**坐标化远程控制**回传到真实标签页（DOM 模式按视口缩放映射，像素模式坐标天然对齐），前端只请求“控制权”、由共享标签页批准后生效。
 
-> **这是 DOM 镜像，不是反代**：目标网页的 JS 始终在服务器那台**已登录 Chrome** 里运行（保留登录态与会员）；访客浏览器里**不运行目标站点脚本、也不持有目标站 Cookie**。`/resource` 只中继图片 / 字体 / 样式等静态资源（平台域名白名单 + 登录态校验），**不转发页面文档与 API 请求**，因此不是传统网页反向代理。相比 Scramjet 一类“客户端拦截式代理”（访客各自登录、不共享服务器会员、不省流量），本方案维持“共享一台已登录会员、按人隔离”的设计。
+> **这是 DOM 镜像，不是反代**：目标网页的 JS 始终在服务器那台**已登录 Chrome** 里运行（保留登录态与会员）；访客浏览器里**不运行目标站点脚本、也不持有目标站 Cookie**，只收到一份结构化的页面快照与增量补丁。`/resource` 只中继图片 / 字体 / 样式等静态资源（平台域名白名单 + 登录态校验，且只对纯静态 CDN 域名做镜像内 URL 改写），**不转发页面文档与 API 请求**，因此不是传统网页反向代理。我们评估过 [Scramjet](https://github.com/MercuryWorkshop/scramjet)：它是“客户端拦截式代理”——在访客浏览器里劫持并运行目标站点、访客各自登录，既不共享服务器会员、也不省流量，与本项目“共享一台已登录会员、按人隔离”的目标冲突，故最终采用 PhantomStream 这类**服务端 DOM 镜像**（在服务器侧采集、向访客只读重建）。
+>
+> **两处工程适配**：① 原生 CDP `Runtime.addBinding` 只能向宿主机转发单个字符串参数（传对象会被静默丢弃），而 PhantomStream 官方 Node 适配器使用的是 Playwright `page.exposeBinding`（内部做了 JSON 序列化）；因此注入脚本里加了一个 raw-binding shim，把 `__phantomStreamBridge(对象)` 统一 `JSON.stringify` 后再经 CDP 绑定传出。② 我们引入的预构建 capture 产物早于上游 `maskAssetUrlFn` 资源改写钩子，故静态资源 URL 改写放在后端完成（`PhantomSession._rewrite_asset_urls`，对快照与增量帧中出现的静态 CDN 链接统一改写为 `/resource`，字段无关、更鲁棒）。
 
 - **账号模型**：所有用户共享同一台机器上**同一个已登录的 Chrome 配置**（即同一个 ChatGPT Plus / Gemini 账号），但系统为每个“用户 × 平台”分配一个**独立的浏览器标签页并打开平台根地址（全新对话）**。不同标签页的对话天然隔离、可并行，互不影响。
 - **会话归属与历史隔离**：注入脚本记录每个用户实际打开过的对话 id（`data/ownership.json`，按用户持久化），侧边栏中**不属于本人的历史对话会被隐藏，并且不会进入下发的 DOM 快照**，因此访客只能看到自己发出的会话、也能正确回看自己的历史；**管理员（role=admin）不过滤，可见全部历史**，便于排障。
@@ -315,7 +317,11 @@ DEFAULT_PLATFORM=chatgpt
 - **`start_all.bat`** / **`start_all.sh`**：Windows / macOS·Linux 一键自检、安装、接管与运行脚本。
 - **`run_all.py`**：主 Python 编排服务，跨平台负责浏览器探测、ngrok 配置、子进程监控与进程树生命周期回收。
 - **`web_server.py`**：带登录鉴权、安全头、gzip 与线程池的 Web 服务（默认入口，取代旧的 Streamlit 运行方式）。
-- **`desktop_server.py`**：1:1 共享桌面服务（aiohttp + WebSocket），负责钉钉 SSO 登录路由、CDP 画面串流与键鼠 / 中文输入回传（默认 8502 端口）。
+- **`desktop_server.py`**：1:1 共享桌面服务（aiohttp + WebSocket），负责钉钉 SSO 登录路由与两条画面通道：`/pws`（DOM 镜像：PhantomStream 快照/增量帧中继、坐标化远程控制、出站 deflate-raw 解码、静态资源 URL 改写）与 `/ws`（高清像素：screencast JPEG 回退），以及带登录态的 `/resource` 子资源中继（默认 8502 端口）。
+- **`phantom_inject.py`**：构建注入共享标签页的 PhantomStream capture 脚本（注入桥接 token、隔离用 `skipElement`、raw-binding shim 与 relay origin）。
+- **`page_inject.py`**：页面归属/隔离/限制注入脚本——标记本人对话、隐藏他人历史与登出/设置/账号入口、URL 守卫（capture 据此跳过这些节点）。
+- **`vendor/phantom-stream/`**：PhantomStream 预构建、自包含的 capture 注入脚本（classic script，无 Node 构建步骤，CDP 直接注入）与 MIT 许可。
+- **`static/vendor/phantom-stream/`**：PhantomStream 前端 ESM（renderer / protocol / transport），由 `desktop.html` 动态 import。
 - **`browser_pool.py`**：每“用户 × 平台”独立标签页的会话池，负责并发标签页管理、空闲回收与上限保护。
 - **`dingtalk_sso.py`**：钉钉 OAuth2 授权码登录客户端（授权跳转、换取 userAccessToken、拉取 openId / 昵称）。
 - **`auth.py`**：用户认证模块（PBKDF2 密码哈希、服务端会话、登录限流、账号管理 CLI、SSO 账号接入）。
@@ -325,8 +331,8 @@ DEFAULT_PLATFORM=chatgpt
 - **`gemini_adapter.py`**：Google Gemini 网页驱动，负责登录检测、新建对话隔离、内容输入、发送、等待完成与回复提取（选择器集中容错）。
 - **`config.py`**：全局配置加载（含 Web、安全、白名单、上传限制、桌面串流、跨平台路径等）。
 - **`static/index.html`**：网页端控制台（Vue 3），含登录/注册页、用户菜单与会话管理。
-- **`static/desktop.html`**：1:1 共享桌面前端（实时画面渲染、键鼠 / IME 输入采集、平台切换、钉钉登录）。
-- **`static/vendor/`**：本地托管的前端库（Vue / Tailwind / Marked），无需外网 CDN 即可加载。
+- **`static/desktop.html`**：1:1 共享桌面前端（DOM 模式动态 import PhantomStream viewer 重建沙箱镜像并叠加坐标控制层；像素模式走 canvas；键鼠 / IME 采集、平台切换、模式切换、钉钉登录）。
+- **`static/vendor/`**：本地托管的前端库（Vue / Tailwind / Marked / PhantomStream ESM），无需外网 CDN 即可加载。
 - **`data/`**（运行时生成，已 gitignore）：账户、会话与服务端密钥。
 - **`.env.example`**：配置指南模板。
 
@@ -334,5 +340,10 @@ DEFAULT_PLATFORM=chatgpt
 
 ## 📄 开源协议
 
-本项目基于 **[MIT License](file:///d:/pycharmProject/webgpt2api/LICENSE)** 协议开源，欢迎自由分发、修改与使用！
+本项目基于 **MIT License** 协议开源，欢迎自由分发、修改与使用！
+
+### 第三方组件
+
+- DOM 镜像能力基于 [PhantomStream](https://github.com/fullselfbrowsing/PhantomStream)（[fullselfbrowsing](https://github.com/fullselfbrowsing)，**MIT License**），其 capture 注入脚本与前端 ESM 源码及对应许可已分别随附在 `vendor/phantom-stream/LICENSE` 与 `static/vendor/phantom-stream/LICENSE`；本项目仅做协议中继、隔离与远程控制接入，未修改其核心算法。
+- 其余前端库（Vue / Tailwind / Marked）均为各自许可下的开源软件。
 

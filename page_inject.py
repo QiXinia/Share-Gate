@@ -1,26 +1,27 @@
 """Scripts injected into every shared browser tab.
 
 The script runs in the page's own main world and is idempotent (safe to inject
-on every navigation and on every client reconnect). It provides three things:
+on every navigation and on every client reconnect). It provides the *policy*
+layer; the actual DOM mirroring is done by the vendored PhantomStream capture
+(see phantom_inject.py).
 
 1. Conversation ownership / history isolation
    - Reports the conversation id opened in THIS tab to the backend (so the
      backend can attribute it to the logged-in user).
-   - Hides sidebar history entries belonging to other users. Admins see all.
+   - Marks sidebar history entries belonging to other users with
+     ``data-sg-hidden`` (and hides them). Admins see all. The PhantomStream
+     capture uses ``skipElement`` to drop these subtrees from snapshots and
+     diffs, so other users' conversations never leave the browser.
 
 2. UI lockdown
-   - Hides / blocks logout, settings, subscription/account entries and
-     intercepts navigation to login / auth / account pages, so a guest can't
-   log the shared account out or change its settings.
-
-3. DOM-mirror collector (traffic-saving mode)
-   - Serializes the computed CSS + a cloned body (resources rewritten to a
-     placeholder handled by the backend /resource endpoint), and pushes
-     throttled snapshots to the backend via the CDP Runtime binding __sgPush.
+   - Marks logout / settings / subscription / account entries with
+     ``data-sg-lock`` (also dropped from the mirror) and intercepts
+     navigation to login / auth / account pages, so a guest can't log the
+     shared account out or change its settings.
 
 The backend injects this via Page.addScriptToEvaluateOnNewDocument and also
 evaluates it once for the currently loaded document. Bindings used:
-__sgPush (dom snapshots), __sgOwn (conversation attribution), __sgEvent.
+__sgOwn (conversation attribution), __sgEvent (blocked-action notices).
 """
 import json
 
@@ -89,10 +90,16 @@ JS = r"""
       var a = anchors[i];
       var id = idFromHref(a.getAttribute('href'));
       if(!id) continue;
-      var box = a.closest('li') || a.closest('[role="listitem"]') ||
-                a.parentElement || a;
+      // Prefer the real conversation row container. When the site does not
+      // wrap items in <li>/listitem, fall back to the anchor itself rather
+      // than its parentElement: several entries can share one parent, and
+      // hiding that parent would wrongly hide other users' *and* our own
+      // conversations in the same group.
+      var box = a.closest('li') || a.closest('[role="listitem"]') || a;
       if(!owned.has(id)){
-        box.setAttribute('data-sg-hidden','1');
+        if(box.getAttribute('data-sg-hidden') !== '1'){
+          box.setAttribute('data-sg-hidden','1');
+        }
         box.style.setProperty('display','none','important');
       } else if(box.getAttribute('data-sg-hidden')){
         box.removeAttribute('data-sg-hidden');
@@ -132,7 +139,9 @@ JS = r"""
       // The settings cog in the sidebar / chat header.
       if(/settings|设置/i.test(label) && el.closest('button,a,[role="button"]')) bad = true;
       if(bad){
-        el.setAttribute('data-sg-lock','1');
+        if(el.getAttribute('data-sg-lock') !== '1'){
+          el.setAttribute('data-sg-lock','1');
+        }
         el.style.setProperty('display','none','important');
       }
     }
@@ -188,119 +197,24 @@ JS = r"""
   }
 
   // -------------------------------------------------------------------------
-  // 3. DOM-mirror collector
+  // Keep isolation/lockdown markers fresh as the SPA re-renders. A light
+  // observer (no serialization) re-runs the two policies; the vendored
+  // PhantomStream capture reads the resulting data-sg-* markers.
   // -------------------------------------------------------------------------
-  function resUrl(u){
-    try{
-      if(!u || /^(data:|blob:|javascript:|#|mailto:|tel:)/.test(u)) return u;
-      var abs = new URL(u, location.href).href;
-      return '__SG_RES__' + abs;
-    }catch(e){ return u; }
-  }
-  function rewriteUrlsInCss(css){
-    return css.replace(/url\(\s*(['"]?)([^)'"]+)\1\s*\)/g, function(m,q,u){
-      if(/^(data:|blob:)/.test(u)) return m;
-      return 'url(' + q + resUrl(u) + q + ')';
-    });
-  }
-  function collectCss(){
-    var out = [];
-    var sheets = document.styleSheets;
-    for(var i=0;i<sheets.length;i++){
-      var sh = sheets[i];
-      try{
-        if(sh.cssRules && sh.cssRules.length){
-          var css = '';
-          for(var j=0;j<sh.cssRules.length;j++) css += sh.cssRules[j].cssText + '\n';
-          if(css) out.push(rewriteUrlsInCss(css));
-        }
-      }catch(e){
-        // Cross-origin stylesheet: include it as a relayed <link>.
-        if(sh.href) out.push('<link rel="stylesheet" href="' + resUrl(sh.href) + '">');
-      }
-    }
-    return out;
-  }
-  function cloneBody(){
-    var clone = document.body.cloneNode(true);
-    // The mirror is read-only: never ship or execute target scripts.
-    clone.querySelectorAll('script,noscript,iframe').forEach(function(n){
-      n.parentNode && n.parentNode.removeChild(n);
-    });
-    // Do not transmit other users' history or locked UI entries at all.
-    clone.querySelectorAll('[data-sg-hidden],[data-sg-lock]').forEach(function(n){
-      n.parentNode && n.parentNode.removeChild(n);
-    });
-    var sel = 'img,source,video,audio,use,link,input,image';
-    var nodes = clone.querySelectorAll(sel);
-    for(var i=0;i<nodes.length;i++){
-      var el = nodes[i];
-      ['src','poster','href','xlink:href'].forEach(function(attr){
-        var v = el.getAttribute(attr);
-        if(v && !/^(data:|blob:|javascript:|#)/.test(v)){
-          el.setAttribute(attr, resUrl(v));
-        }
-      });
-      if(el.getAttribute('srcset')){
-        el.setAttribute('srcset', el.getAttribute('srcset').split(',').map(function(part){
-          var bits = part.trim().split(/\s+/);
-          return resUrl(bits[0]) + (bits.length>1 ? ' ' + bits.slice(1).join(' ') : '');
-        }).join(', '));
-      }
-      if(el.getAttribute('style') && el.getAttribute('style').indexOf('url(') !== -1){
-        el.setAttribute('style', rewriteUrlsInCss(el.getAttribute('style')));
-      }
-    }
-    clone.querySelectorAll('[style*="url("]').forEach(function(el){
-      el.setAttribute('style', rewriteUrlsInCss(el.getAttribute('style')));
-    });
-    return clone.outerHTML;
-  }
-
-  var mirrorOn = false, cssSent = false, queued = false, lastSent = 0;
-  var MIN_INTERVAL = 130;
-  function flush(){
-    queued = false;
-    if(!mirrorOn || !document.body) return;
-    lastSent = performance.now();
-    var payload = {
-      type:'dom',
-      html: cloneBody(),
-      base: location.href,
-      scrollTop: Math.round(window.scrollY || document.documentElement.scrollTop || 0),
-      scrollHeight: document.documentElement.scrollHeight,
-      vw: window.innerWidth, vh: window.innerHeight
-    };
-    if(!cssSent){ payload.css = collectCss(); cssSent = true; }
-    post('__sgPush', payload);
-  }
-  function schedule(){
-    if(!mirrorOn) return;
-    var wait = Math.max(0, MIN_INTERVAL - (performance.now() - lastSent));
-    if(!queued){ queued = true; setTimeout(flush, wait); }
-  }
-  window.__sgMirrorStart = function(){
-    if(mirrorOn) return;
-    if(!document.documentElement){ setTimeout(window.__sgMirrorStart, 50); return; }
-    mirrorOn = true;
-    new MutationObserver(function(){
-      schedule();
-      scanLockdownDebounced();
-      hideHistoryDebounced();
-    }).observe(document.documentElement,
-      {subtree:true, childList:true, attributes:true, characterData:true});
-    window.addEventListener('scroll', schedule, {passive:true});
-    window.addEventListener('resize', schedule, {passive:true});
-    // Start with a couple of frames to catch late-rendered SPA content.
-    flush();
-    setTimeout(flush, 300);
-    setTimeout(flush, 1000);
-  };
-  window.__sgMirrorOn = function(){ return mirrorOn; };
-  window.__sgMirrorRequestFrame = function(){ schedule(); };
-
   var scanLockdownDebounced = debounce(function(){ scanLockdown(); }, 200);
   var hideHistoryDebounced = debounce(function(){ hideForeignHistory(); }, 200);
+  function refreshPolicies(){
+    scanLockdownDebounced();
+    hideHistoryDebounced();
+  }
+  (function observe(){
+    function attach(){
+      if(!document.documentElement){ setTimeout(attach, 10); return; }
+      new MutationObserver(refreshPolicies).observe(document.documentElement,
+        {subtree:true, childList:true, attributes:true, characterData:true});
+    }
+    attach();
+  })();
 
   // -------------------------------------------------------------------------
   // Boot
@@ -312,19 +226,11 @@ JS = r"""
     guardNav();
   }
   function boot(){
-    try{
-      applyGuards();
-      // DOM mode starts the mirror automatically on every (re)load; stream
-      // mode leaves it off to save bandwidth.
-      if(CFG.mode === 'dom' && window.__sgMirrorStart){ window.__sgMirrorStart(); }
-    }catch(e){ window.__sgErr = String(e && e.stack || e); }
+    try{ applyGuards(); }
+    catch(e){ window.__sgErr = String(e && e.stack || e); }
     // Periodic safety net for SPA re-renders.
     setInterval(function(){
-      try{
-        applyGuards();
-        if(CFG.mode === 'dom' && window.__sgMirrorStart && !window.__sgMirrorOn())
-          window.__sgMirrorStart();
-      }catch(e){ window.__sgErr = String(e && e.stack || e); }
+      try{ applyGuards(); }catch(e){ window.__sgErr = String(e && e.stack || e); }
     }, 1500);
   }
   // Diagnostics hook (also used by the host to re-run guards).
@@ -344,12 +250,13 @@ JS = r"""
 
 def build_inject_script(platform, owned_ids, is_admin=False, lock_ui=True,
                         mode="dom"):
+    # `mode` is accepted for call-site compatibility; the policy layer runs in
+    # both mirror modes.
     cfg = {
         "platform": platform,
         "owned": list(owned_ids or []),
         "isAdmin": bool(is_admin),
         "lockUI": bool(lock_ui),
-        "mode": mode if mode in ("dom", "stream") else "dom",
     }
     js = JS.replace("__SG_CONFIG__", json.dumps(cfg))
     js = js.replace("__LOGOUT_RE__", _LOGOUT_RE)

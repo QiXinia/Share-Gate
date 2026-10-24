@@ -39,19 +39,29 @@
   .tool-btn:hover { border-color:var(--accent); }
   #user { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
   #user img { width:24px; height:24px; border-radius:50%; }
-  #stage { flex:1; position:relative; overflow:hidden; background:#0b0d12; }
-  #screen { background:#fff; position:absolute; inset:0; width:100%; height:100%; box-shadow:0 0 0 1px var(--line); }
-  #mirror { position:absolute; inset:0; width:100%; height:100%; border:0; background:#fff;
-    display:none; box-shadow:0 0 0 1px var(--line); }
-  body.mode-dom #mirror { display:block; }
-  body.mode-dom #screen { display:none; }
-  body.mode-stream #mirror { display:none; }
-  body.mode-stream #screen { display:block; }
+  #stage { flex:1; position:relative; overflow:hidden; background:#0b0d12; outline:none; }
+  /* High-fidelity pixel mode */
+  #screen { background:#fff; position:absolute; inset:0; width:100%; height:100%;
+    box-shadow:0 0 0 1px var(--line); display:none; }
   #capture { position:absolute; inset:0; width:100%; height:100%; opacity:0; resize:none; z-index:4;
-    caret-color:transparent; border:0; background:transparent; color:transparent; cursor:default; outline:none; }
+    caret-color:transparent; border:0; background:transparent; color:transparent; cursor:default;
+    outline:none; display:none; }
+  body.mode-stream #screen, body.mode-stream #capture { display:block; }
+  /* DOM-mirror (PhantomStream) interaction overlay. The viewer's own iframe
+     sits below (z-index 1) and is script-sandboxed; this div forwards input. */
+  #poverlay { position:absolute; inset:0; z-index:6; display:none;
+    pointer-events:none; cursor:default; }
+  body.mode-dom #poverlay { display:block; }
+  #stage.control-active #poverlay { pointer-events:auto; cursor:text; }
+  /* click feedback ring */
+  .ps-ring { position:absolute; width:26px; height:26px; border:2px solid var(--accent);
+    border-radius:50%; transform:translate(-50%,-50%); pointer-events:none; z-index:7;
+    animation:psring .45s ease-out forwards; }
+  @keyframes psring { from{opacity:.9; transform:translate(-50%,-50%) scale(.6);}
+    to{opacity:0; transform:translate(-50%,-50%) scale(1.4);} }
   #statusbar { position:absolute; top:10px; left:50%; transform:translateX(-50%); padding:6px 14px;
     border-radius:20px; background:rgba(20,23,31,.9); border:1px solid var(--line); font-size:12px;
-    color:var(--muted); z-index:5; }
+    color:var(--muted); z-index:9; pointer-events:none; }
   #statusbar.ok { color:#5fe0b0; }
   #statusbar.err { color:#ff8585; }
 </style>
@@ -85,26 +95,21 @@
       <div id="user"><span id="nick"></span><img id="avatar" alt="" style="display:none"></div>
       <button class="tool-btn" id="logoutBtn">退出</button>
     </div>
-    <div id="stage">
-      <iframe id="mirror" title="shared desktop" sandbox="allow-same-origin"></iframe>
+    <div id="stage" tabindex="0">
       <canvas id="screen"></canvas>
       <textarea id="capture" autocomplete="off" autocorrect="off"
         autocapitalize="off" spellcheck="false"></textarea>
+      <div id="poverlay" aria-hidden="true"></div>
       <div id="statusbar">正在连接…</div>
     </div>
   </div>
 
-<script>
+<script type="module">
 const $ = (id) => document.getElementById(id);
-let me = null, ws = null, platform = null, mode = 'dom';
+let me = null, platform = null, mode = 'dom';
 const platformLabels = {};
-const RES_TOKEN = '__SG_RES__';
-
-// Replace server resource placeholders with the authenticated relay endpoint.
-function fixResources(text) {
-  return text.replace(new RegExp(RES_TOKEN.replace(/_/g, '\\_') + '([^\\s"\\\')\\\\]+)', 'g'),
-    (m, u) => `${location.origin}/resource?u=${encodeURIComponent(u)}&platform=${platform}`);
-}
+const VENDOR = '/static/vendor/phantom-stream';
+const stage = $('stage');
 
 // ---------------- Auth ----------------
 async function loadMe() {
@@ -124,7 +129,6 @@ function showApp() {
   $('nick').textContent = me.display_name || me.username;
   if (me.avatar) { $('avatar').src = me.avatar; $('avatar').style.display='block'; }
   Object.assign(platformLabels, me.platform_labels || {});
-  // platform tabs
   const list = me.platforms && me.platforms.length ? me.platforms : ['chatgpt'];
   $('tabs').innerHTML = '';
   list.forEach((p) => {
@@ -136,7 +140,6 @@ function showApp() {
   });
   const initial = list.includes(new URLSearchParams(location.search).get('platform'))
     ? new URLSearchParams(location.search).get('platform') : list[0];
-  // Pick up the server-configured default rendering mode before connecting.
   fetch('/api/desktop-config').then(r => r.ok ? r.json() : null)
     .then(cfg => { if (cfg && cfg.default_mode) applyMode(cfg.default_mode); })
     .catch(() => {})
@@ -157,8 +160,6 @@ $('logoutBtn').onclick = async () => {
   await fetch('/auth/logout', { method:'POST' }); location.reload();
 };
 
-// ---------------- Platform / streaming ----------------
-let mirrorCss = '';
 function applyMode(m) {
   mode = m;
   document.body.classList.toggle('mode-dom', m === 'dom');
@@ -167,7 +168,6 @@ function applyMode(m) {
 }
 applyMode(mode);
 function switchPlatform(p) {
-  if (platform === p && ws && ws.readyState === 1) return;
   platform = p;
   document.querySelectorAll('.tab').forEach((t) =>
     t.classList.toggle('active', t.dataset.platform === p));
@@ -178,91 +178,257 @@ function setStatus(text, cls) {
   el.textContent = text;
   el.className = cls || '';
 }
-
-// Render a DOM mirror snapshot into a script-disabled sandboxed iframe.
-function renderDom(d) {
-  if (d.css && d.css.length) mirrorCss = d.css.map(fixResources).join('\n');
-  const parsed = new DOMParser().parseFromString(d.html || '', 'text/html');
-  const body = parsed.body || document.createElement('body');
-  const bodyInner = fixResources(body.innerHTML);
-  const cls = body.className || '';
-  const st = -(d.scrollTop || 0);
-  const srcdoc =
-    '<!doctype html><html><head><meta charset="utf-8">' +
-    '<base href="' + (d.base || '') + '">' +
-    '<style>html,body{margin:0;padding:0;}html{overflow:hidden;background:#fff;}' +
-    'body{transform:translateY(' + st + 'px);}' + mirrorCss + '</style></head>' +
-    '<body class="' + cls + '">' + bodyInner + '</body></html>';
-  $('mirror').srcdoc = srcdoc;
+$('modeBtn').onclick = () => {
+  applyMode(mode === 'dom' ? 'stream' : 'dom');
+  if (platform) connect(platform);
+};
+$('newChat').onclick = () => controlAction('new_chat');
+$('reload').onclick = () => controlAction('reload');
+function controlAction(action) {
+  if (mode === 'dom' && dom && dom.transport) {
+    dom.transport.send('sg:control', { action });
+  } else if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type:'control', action }));
+  }
 }
 
-function connect(p) {
-  if (ws) { try { ws.onclose = null; ws.close(); } catch(e){} ws = null; }
-  mirrorCss = '';
+// ===========================================================================
+// DOM mirror (PhantomStream)
+// ===========================================================================
+let dom = null;   // { viewer, transport, lifecycle, control }
+
+async function connectDom(p) {
+  disconnectDom();
+  setStatus('正在连接 ' + (platformLabels[p] || p) + '…');
+  const { createViewer, mapHostPointToViewport } =
+    await import(`${VENDOR}/renderer/index.js`);
+  const { createWebSocketTransport } =
+    await import(`${VENDOR}/transport/websocket.js`);
+  const { REMOTE_CONTROL } = await import(`${VENDOR}/protocol/index.js`);
+  window.__psMap = mapHostPointToViewport;
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${proto}://${location.host}/pws?platform=${encodeURIComponent(p)}`
+            + `&room=${encodeURIComponent((me.username || 'u') + ':' + p)}&role=viewer`;
+  const logger = { info(){}, warn(){}, error(){ console.warn('[PhantomStream]', ...arguments); } };
+  const inner = createWebSocketTransport({ url, role: 'viewer', logger });
+  const control = { state: 'locked', seq: 0 };
+  const transport = {
+    send: (t, payload) => inner.send(t, payload),
+    flush: () => inner.flush && inner.flush(),
+    onMessage: (h) => inner.onMessage((t, payload) => {
+      if (t === REMOTE_CONTROL.STATE) { setControlState((payload || {}).state || 'locked'); return; }
+      if (t.indexOf('sg:') === 0) { handleSg(t, payload || {}); return; }
+      h(t, payload);
+    }),
+    onStatus: (h) => inner.onStatus(h),
+    close: () => inner.close && inner.close(),
+    getHealth: () => inner.getHealth ? inner.getHealth() : {},
+  };
+  const viewer = createViewer({
+    container: stage,
+    transport,
+    disconnectDelayMs: 4000,
+    mediaMode: 'reference',
+    // The viewer's own host serves /resource; widen the asset gate for it so
+    // same-origin relayed media (which carries the shared session cookies) is
+    // allowed even on LAN/loopback hosts.
+    allowAssetOrigins: [location.hostname],
+    logger,
+  });
+  const lifecycle = { state: 'connecting' };
+  dom = { viewer, transport, control, lifecycle, RC: REMOTE_CONTROL };
+
+  viewer.on('state', (ev) => {
+    lifecycle.state = ev.state;
+    if (ev.state === 'live') {
+      setStatus('已连接 · 点击画面即可操作', 'ok');
+      requestControl();
+    } else if (ev.state === 'stale') {
+      setStatus('正在刷新画面…', 'err');
+    } else if (ev.state === 'disconnected') {
+      setStatus('连接已断开，等待重连…', 'err');
+    }
+  });
+  transport.onStatus((s) => {
+    if (s.state === 'open') {
+      transport.send('dash:dom-stream-start', { trigger: 'viewer-open' });
+    }
+  });
+
+  function setControlState(s) {
+    control.state = s;
+    stage.classList.toggle('control-active', s === 'active');
+    if (s === 'active') setStatus('已连接 · 可直接操作', 'ok');
+  }
+  function requestControl() {
+    if (lifecycle.state !== 'live' || control.state === 'requesting'
+        || control.state === 'active') return;
+    control.seq += 1;
+    control.state = 'requesting';
+    transport.send(REMOTE_CONTROL.REQUEST, {
+      requestId: 'viewer-' + Date.now().toString(36) + '-' + control.seq,
+      authorizationMode: 'approve',
+    });
+  }
+  window.__psRequestControl = requestControl;
+  window.__psControl = () => control.state;
+
+  // sg: host channel (ready/notice/error).
+  function handleSg(t, payload) {
+    if (t === 'sg:ready') setStatus('已连接 · 点击画面即可操作', 'ok');
+    else if (t === 'sg:notice') setStatus(payload.message || '提示', 'err');
+    else if (t === 'sg:error') setStatus(payload.message || '串流错误', 'err');
+  }
+  window.__psSg = handleSg;
+
+  bindDomInput(viewer, transport, REMOTE_CONTROL, mapHostPointToViewport);
+}
+
+function disconnectDom() {
+  stage.classList.remove('control-active');
+  if (!dom) return;
+  try { dom.viewer && dom.viewer.destroy(); } catch (e) {}
+  try { dom.transport && dom.transport.close(); } catch (e) {}
+  dom = null;
+}
+
+// Map a host pointer event to the source page viewport coordinates.
+function mapPoint(viewer, mapFn, clientX, clientY) {
+  const rect = stage.getBoundingClientRect();
+  const mapping = viewer.getViewportMapping();
+  return mapFn({ x: clientX - rect.left, y: clientY - rect.top }, mapping.scale);
+}
+
+function bindDomInput(viewer, transport, RC, mapFn) {
+  const overlay = $('poverlay');
+  const isPrintable = (e) => e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+  const active = () => dom && dom.control.state === 'active';
+  const ring = (clientX, clientY) => {
+    const r = stage.getBoundingClientRect();
+    const el = document.createElement('div');
+    el.className = 'ps-ring';
+    el.style.left = (clientX - r.left) + 'px';
+    el.style.top = (clientY - r.top) + 'px';
+    stage.appendChild(el);
+    setTimeout(() => el.remove(), 450);
+  };
+  const sendClick = (e, button) => {
+    if (!active()) return;
+    const pt = mapPoint(viewer, mapFn, e.clientX, e.clientY);
+    if (!pt.inside) return;
+    transport.send(RC.CLICK, { x: Math.round(pt.x), y: Math.round(pt.y),
+                               button: button, clickCount: 1 });
+    ring(e.clientX, e.clientY);
+  };
+  overlay.addEventListener('click', (e) => {
+    overlay.focus();
+    if (e.button === 0 || e.detail !== undefined) sendClick(e, 'left');
+  });
+  overlay.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    sendClick(e, 'right');
+  });
+  overlay.addEventListener('wheel', (e) => {
+    if (!active()) return;
+    e.preventDefault();
+    const pt = mapPoint(viewer, mapFn, e.clientX, e.clientY);
+    if (!pt.inside) return;
+    let dx = e.deltaX, dy = e.deltaY;
+    if (e.deltaMode === 1) { dx *= 33; dy *= 33; }
+    else if (e.deltaMode === 2) { dx *= stage.clientWidth; dy *= stage.clientHeight; }
+    transport.send(RC.SCROLL, { x: Math.round(pt.x), y: Math.round(pt.y),
+                                deltaX: Math.round(dx), deltaY: Math.round(dy) });
+  }, { passive: false });
+
+  overlay.addEventListener('keydown', (e) => {
+    if (!active()) return;
+    if (e.isComposing) return;
+    if (e.key === 'Escape') { e.preventDefault(); return; }
+    const combo = e.ctrlKey || e.metaKey || e.altKey;
+    if (isPrintable(e) && !combo) {
+      e.preventDefault();
+      transport.send(RC.TEXT, { text: e.key });
+      return;
+    }
+    e.preventDefault();
+    transport.send(RC.KEY, { key: e.key, event: 'down' });
+  });
+  overlay.addEventListener('keyup', (e) => {
+    if (!active() || isPrintable(e)) return;
+    if (e.key === 'Escape') return;
+    e.preventDefault();
+    transport.send(RC.KEY, { key: e.key, event: 'up' });
+  });
+  // Chinese / IME composition -> insert the composed text as one payload.
+  overlay.addEventListener('compositionend', (e) => {
+    if (active() && e.data) transport.send(RC.TEXT, { text: e.data });
+  });
+  overlay.setAttribute('tabindex', '0');
+}
+
+// ===========================================================================
+// High-fidelity pixel streaming (/ws)
+// ===========================================================================
+let ws = null;
+function connectStream(p) {
+  disconnectStream();
   setStatus('正在连接 ' + (platformLabels[p] || p) + '…');
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(
-    `${proto}://${location.host}/ws?platform=${encodeURIComponent(p)}&mode=${mode}`);
+  ws = new WebSocket(`${proto}://${location.host}/ws?platform=${encodeURIComponent(p)}`);
   const canvas = $('screen');
   const ctx = canvas.getContext('2d');
-
   ws.onopen = () => {
-    const stage = $('stage');
     ws.send(JSON.stringify({ type:'hello', width:stage.clientWidth, height:stage.clientHeight }));
   };
   ws.onmessage = (ev) => {
     let d; try { d = JSON.parse(ev.data); } catch(e){ return; }
-    if (d.type === 'ready') {
-      applyMode(d.mode || mode);
-      setStatus('已连接 · 点击画面即可操作', 'ok');
-    }
-    else if (d.type === 'dom') {
-      renderDom(d);
-    }
+    if (d.type === 'ready') setStatus('已连接 · 高清模式', 'ok');
     else if (d.type === 'frame') {
       canvas.width = d.width; canvas.height = d.height;
       const img = new Image();
       img.onload = () => { ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(img,0,0); };
       img.src = 'data:image/jpeg;base64,' + d.data;
     }
-    else if (d.type === 'notice') {
-      setStatus(d.message || '提示', 'err');
-    }
-    else if (d.type === 'error') { setStatus(d.message || '串流错误', 'err'); }
-    else if (d.type === 'control_result' && d.status === 'error') {
+    else if (d.type === 'notice') setStatus(d.message || '提示', 'err');
+    else if (d.type === 'error') setStatus(d.message || '串流错误', 'err');
+    else if (d.type === 'control_result' && d.status === 'error')
       setStatus(d.message || '操作失败', 'err');
-    }
   };
   ws.onclose = () => setStatus('连接已断开，2 秒后重连…', 'err');
   ws.onerror = () => setStatus('连接错误', 'err');
 }
+function disconnectStream() {
+  if (ws) { try { ws.onclose = null; ws.close(); } catch(e){} ws = null; }
+}
 
-// Toggle between DOM (traffic-saving) and HD (pixel) modes, then reconnect.
-$('modeBtn').onclick = () => {
-  applyMode(mode === 'dom' ? 'stream' : 'dom');
-  if (platform) connect(platform);
-};
+function connect(p) {
+  // Clean up both transports before switching.
+  disconnectDom();
+  disconnectStream();
+  if (mode === 'dom') {
+    connectDom(p).catch((e) => { console.error(e); setStatus('DOM 模式初始化失败', 'err'); });
+  } else {
+    connectStream(p);
+  }
+}
 
 // Resize (debounced)
 let resizeTimer = null;
 new ResizeObserver(() => {
-  if (!ws || ws.readyState !== 1) return;
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
-    const stage = $('stage');
-    ws.send(JSON.stringify({ type:'resize', width:stage.clientWidth, height:stage.clientHeight }));
-  }, 300);
-}).observe($('stage'));
+    const w = stage.clientWidth, h = stage.clientHeight;
+    if (mode === 'dom' && dom && dom.transport) {
+      dom.transport.send('sg:resize', { width: w, height: h });
+    } else if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type:'resize', width:w, height:h }));
+    }
+  }, 400);
+}).observe(stage);
 
-// Toolbar
-$('newChat').onclick = () => ws && ws.readyState === 1 &&
-  ws.send(JSON.stringify({ type:'control', action:'new_chat' }));
-$('reload').onclick = () => ws && ws.readyState === 1 &&
-  ws.send(JSON.stringify({ type:'control', action:'reload' }));
-
-// ---------------- Input capture ----------------
+// ----- Pixel-mode input capture -----
 const cap = $('capture');
-const stage = $('stage');
 function point(e) {
   const r = stage.getBoundingClientRect();
   return { x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top) };
@@ -270,88 +436,78 @@ function point(e) {
 function modifiers(e) {
   return (e.altKey?1:0) | (e.ctrlKey?2:0) | (e.metaKey?4:0) | (e.shiftKey?8:0);
 }
-function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
-
+function sendRaw(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 stage.addEventListener('mousedown', (e) => {
+  if (mode !== 'stream') return;
   cap.focus();
   const {x,y} = point(e);
-  send({ type:'input', subtype:'mouseDown', x, y, button:e.button, buttons:e.buttons,
-         clickCount:e.detail || 1, modifiers:modifiers(e) });
+  sendRaw({ type:'input', subtype:'mouseDown', x, y, button:e.button, buttons:e.buttons,
+            clickCount:e.detail || 1, modifiers:modifiers(e) });
 });
 stage.addEventListener('mousemove', (e) => {
+  if (mode !== 'stream') return;
   const {x,y} = point(e);
-  send({ type:'input', subtype:'mouseMove', x, y, buttons:e.buttons, modifiers:modifiers(e) });
+  sendRaw({ type:'input', subtype:'mouseMove', x, y, buttons:e.buttons, modifiers:modifiers(e) });
 });
 window.addEventListener('mouseup', (e) => {
-  if (!ws || ws.readyState !== 1) return;
+  if (mode !== 'stream' || !ws || ws.readyState !== 1) return;
   const r = stage.getBoundingClientRect();
   const x = Math.round(e.clientX - r.left), y = Math.round(e.clientY - r.top);
-  send({ type:'input', subtype:'mouseUp', x, y, button:e.button, buttons:e.buttons,
-         modifiers:modifiers(e) });
+  sendRaw({ type:'input', subtype:'mouseUp', x, y, button:e.button, buttons:e.buttons,
+            modifiers:modifiers(e) });
 });
-stage.addEventListener('contextmenu', (e) => e.preventDefault());
+stage.addEventListener('contextmenu', (e) => { if (mode === 'stream') e.preventDefault(); });
 stage.addEventListener('wheel', (e) => {
+  if (mode !== 'stream') return;
   e.preventDefault();
   const {x,y} = point(e);
   let dx = e.deltaX, dy = e.deltaY;
   if (e.deltaMode === 1) { dx *= 33; dy *= 33; }
   else if (e.deltaMode === 2) { dx *= stage.clientWidth; dy *= stage.clientHeight; }
-  send({ type:'input', subtype:'mouseWheel', x, y, deltaX:dx, deltaY:dy,
-         modifiers:modifiers(e) });
+  sendRaw({ type:'input', subtype:'mouseWheel', x, y, deltaX:dx, deltaY:dy,
+            modifiers:modifiers(e) });
 }, { passive:false });
-
-// Keys that must be forwarded as key events (not text).
 const SPECIAL = new Set(['Enter','Backspace','Tab','Delete','Escape','ArrowLeft','ArrowRight',
   'ArrowUp','ArrowDown','Home','End','PageUp','PageDown','F1','F2','F3','F4','F5','F6','F7',
   'F8','F9','F10','F11','F12','Insert']);
 cap.addEventListener('keydown', (e) => {
-  if (!ws || ws.readyState !== 1) return;
-  const mods = modifiers(e);
+  if (mode !== 'stream' || !ws || ws.readyState === 1 !== true) return;
   if (e.isComposing) return;
+  const mods = modifiers(e);
   const combo = e.ctrlKey || e.metaKey || e.altKey;
-  if (combo) {
-    // Forward shortcuts (Ctrl+C/V/A, etc.) as raw keys.
+  if (combo || SPECIAL.has(e.key)) {
     e.preventDefault();
-    send({ type:'input', subtype:'keyDown', key:e.key, code:e.code, vk:e.keyCode, modifiers:mods });
-    return;
-  }
-  if (SPECIAL.has(e.key)) {
-    e.preventDefault();
-    send({ type:'input', subtype:'keyDown', key:e.key, code:e.code, vk:e.keyCode, modifiers:mods });
+    sendRaw({ type:'input', subtype:'keyDown', key:e.key, code:e.code, vk:e.keyCode, modifiers:mods });
     cap.value = '';
   } else if (e.key.length === 1) {
     e.preventDefault();
-    send({ type:'input', subtype:'insertText', text:e.key });
+    sendRaw({ type:'input', subtype:'insertText', text:e.key });
   }
 });
 cap.addEventListener('keyup', (e) => {
-  if (!ws || ws.readyState !== 1) return;
+  if (mode !== 'stream' || !ws || ws.readyState !== 1) return;
   const combo = e.ctrlKey || e.metaKey || e.altKey;
   if (combo || SPECIAL.has(e.key)) {
-    send({ type:'input', subtype:'keyUp', key:e.key, code:e.code, vk:e.keyCode,
-           modifiers:modifiers(e) });
+    sendRaw({ type:'input', subtype:'keyUp', key:e.key, code:e.code, vk:e.keyCode,
+              modifiers:modifiers(e) });
   }
   cap.value = '';
 });
 cap.addEventListener('compositionend', (e) => {
-  if (e.data) send({ type:'input', subtype:'insertText', text:e.data });
+  if (mode === 'stream' && e.data) sendRaw({ type:'input', subtype:'insertText', text:e.data });
   cap.value = '';
 });
 cap.addEventListener('input', () => { cap.value = ''; });
-// Keep focus on the capture layer.
-stage.addEventListener('click', () => cap.focus());
+stage.addEventListener('click', () => { if (mode === 'stream') cap.focus(); });
 
 // ---------------- Boot ----------------
 (async function boot() {
   if (await loadMe()) showApp();
   else {
     showLogin();
-    if (!(await fetch('/auth/me').then(r=>r.ok).catch(()=>false))) {
-      // hide dingtalk button when SSO disabled is unknown; refresh me to learn
-      fetch('/auth/me').then(r=>r.json()).then((j) => {
-        if (j.sso_enabled === false) $('dtBtn').style.display = 'none';
-      }).catch(()=>{});
-    }
+    fetch('/auth/me').then(r=>r.json()).then((j) => {
+      if (j.sso_enabled === false) $('dtBtn').style.display = 'none';
+    }).catch(()=>{});
   }
 })();
 </script>
